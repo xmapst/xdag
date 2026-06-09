@@ -10,7 +10,7 @@ import (
 type RetryPolicy struct {
 	Interval    time.Duration `json:"interval" yaml:"interval"`
 	MaxInterval time.Duration `json:"maxInterval" yaml:"maxInterval"`
-	MaxAttempts int           `json:"maxAttempts" yaml:"maxAttempts"`
+	MaxAttempts int64         `json:"maxAttempts" yaml:"maxAttempts"`
 	Multiplier  float64       `json:"multiplier" yaml:"multiplier"`
 }
 
@@ -38,7 +38,7 @@ func (d *Dagcuter) newRetryExecutor(policy *RetryPolicy) *RetryExecutor {
 }
 
 // ExecuteWithRetry 带重试的执行函数
-func (r *RetryExecutor) ExecuteWithRetry(ctx context.Context, taskName string, fn func(n int) error) error {
+func (r *RetryExecutor) ExecuteWithRetry(ctx context.Context, taskName string, fn func(attempt int64) error) error {
 	if r.policy.MaxInterval > 150*time.Second {
 		r.policy.MaxInterval = 150 * time.Second // 默认最大间隔150秒
 	}
@@ -47,7 +47,8 @@ func (r *RetryExecutor) ExecuteWithRetry(ctx context.Context, taskName string, f
 	infiniteRetry := maxAttempts <= 0
 
 	var lastErr error
-	for attempt := 1; infiniteRetry || attempt <= maxAttempts; attempt++ {
+	var attempt int64
+	for attempt = 1; infiniteRetry || attempt <= maxAttempts; attempt++ {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("context cancelled during retry attempt %d: %w", attempt, ctx.Err())
@@ -87,7 +88,7 @@ func (r *RetryExecutor) ExecuteWithRetry(ctx context.Context, taskName string, f
 }
 
 // calculateBackoff 计算指数退避时间，使用 math.Pow 处理浮点数
-func (r *RetryExecutor) calculateBackoff(attempt int, maxInterval time.Duration) time.Duration {
+func (r *RetryExecutor) calculateBackoff(attempt int64, maxInterval time.Duration) time.Duration {
 	// 使用 math.Pow 进行精确的浮点数幂运算
 	// 公式: baseInterval * (multiplier ^ (attempt - 1))
 	backoff := float64(r.policy.Interval) * math.Pow(r.policy.Multiplier, float64(attempt-1))

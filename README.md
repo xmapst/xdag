@@ -163,35 +163,38 @@ func (t *DemoTask) RetryPolicy() *xdag.RetryPolicy {
     }
 }
 
-func (t *DemoTask) PreExecution(ctx context.Context, input map[string]any) {
-    fmt.Printf("[pre] %s input=%v\n", t.name, input)
+func (t *DemoTask) PreExecution(ctx context.Context, attempt int64, input map[string]any) {
+    fmt.Printf("[pre] %s attempt=%d input=%v\n", t.name, attempt, input)
 }
 
-func (t *DemoTask) Execute(ctx context.Context, input map[string]any) (map[string]any, error) {
+func (t *DemoTask) Execute(ctx context.Context, attempt int64, input map[string]any) (map[string]any, error) {
     switch t.name {
     case "fetch-user":
         return map[string]any{
-            "id":   1001,
-            "name": "Tom",
+            "id":      1001,
+            "name":    "Tom",
+            "attempt": attempt,
         }, nil
     case "fetch-order":
         return map[string]any{
             "order_no": "ORD-001",
             "amount":   199,
+            "attempt":  attempt,
         }, nil
     case "summary":
         return map[string]any{
-            "user":  input["fetch-user"],
-            "order": input["fetch-order"],
-            "ok":    true,
+            "user":    input["fetch-user"],
+            "order":   input["fetch-order"],
+            "attempt": attempt,
+            "ok":      true,
         }, nil
     default:
-        return map[string]any{"task": t.name}, nil
+        return map[string]any{"task": t.name, "attempt": attempt}, nil
     }
 }
 
-func (t *DemoTask) PostExecution(ctx context.Context, output map[string]any, err error) {
-    fmt.Printf("[post] %s output=%v err=%v\n", t.name, output, err)
+func (t *DemoTask) PostExecution(ctx context.Context, attempt int64, output map[string]any, err error) {
+    fmt.Printf("[post] %s attempt=%d output=%v err=%v\n", t.name, attempt, output, err)
 }
 
 func main() {
@@ -235,9 +238,9 @@ type Task interface {
     Name() string
     Dependencies() []string
     RetryPolicy() *RetryPolicy
-    PreExecution(ctx context.Context, input map[string]any)
-    Execute(ctx context.Context, input map[string]any) (map[string]any, error)
-    PostExecution(ctx context.Context, output map[string]any, err error)
+    PreExecution(ctx context.Context, attempt int64, input map[string]any)
+    Execute(ctx context.Context, attempt int64, input map[string]any) (map[string]any, error)
+    PostExecution(ctx context.Context, attempt int64, output map[string]any, err error)
 }
 ```
 
@@ -261,13 +264,9 @@ type Task interface {
   - `input["A"]`
   - `input["B"]`
 
-此外，在 [`executeTask()`](dag.go:109) 中，还会注入：
+此外，在 [`executeTask()`](dag.go:109) 中，当前尝试次数会以显式参数形式传递给 [`PreExecution()`](task.go:11)、[`Execute()`](task.go:13) 和 [`PostExecution()`](task.go:15)。
 
-```go
-inputs["attempt"] = n
-```
-
-这表示当前是第几次尝试执行该任务。
+其中 [`attempt`](task.go:11) 从 `1` 开始，表示当前是第几次尝试执行该任务。
 
 ### 3. 结果缓存
 
@@ -378,7 +377,7 @@ backoff = Interval * Multiplier^(attempt-1)
 
 [`executeTask()`](dag.go:109) 内部通过 [`ExecuteWithRetry()`](retry.go:41) 包裹真实任务执行。每次尝试都会：
 
-1. 写入 `inputs["attempt"]`
+1. 生成当前 [`attempt`](task.go:11)
 2. 调用 [`PreExecution()`](task.go:11)
 3. 调用 [`Execute()`](task.go:13)
 4. 调用 [`PostExecution()`](task.go:15)

@@ -113,15 +113,14 @@ func (d *Dagcuter) executeTask(ctx context.Context, name string, task Task, inpu
 	var result map[string]any
 
 	// 使用重试机制执行任务
-	err := retryExecutor.ExecuteWithRetry(ctx, name, func(n int) error {
-		inputs["attempt"] = n // 将当前尝试次数传递给任务
+	err := retryExecutor.ExecuteWithRetry(ctx, name, func(attempt int64) error {
 		// PreExecution
-		task.PreExecution(ctx, inputs)
+		task.PreExecution(ctx, attempt, inputs)
 
 		// Execute
-		output, err := task.Execute(ctx, inputs)
+		output, err := task.Execute(ctx, attempt, inputs)
 		// PostExecution
-		task.PostExecution(ctx, output, err)
+		task.PostExecution(ctx, attempt, output, err)
 		if err != nil {
 			return fmt.Errorf("execution failed: %w", err)
 		}
