@@ -355,11 +355,14 @@ type RetryPolicy struct {
 
 在 [`newRetryExecutor()`](retry.go:21) 中：
 
-- 若策略为空，则默认不重试
+- 若策略为空，则默认只执行一次
 - 默认重试间隔为 `1s`
 - 默认最大间隔为 `30s`
 - 默认倍率为 `2.0`
-- 若 `MaxAttempts <= 0`，在 [`ExecuteWithRetry()`](retry.go:42) 中会直接执行一次
+- [`MaxAttempts`](retry.go:13) 的语义为“总执行次数”而非“重试次数”
+- 若 [`MaxAttempts`](retry.go:13) `<= 0`，则在 [`ExecuteWithRetry()`](retry.go:41) 中无限重试，直到成功或 [`context.Context`](task.go:11) 被取消
+- 若 [`MaxAttempts`](retry.go:13) `= 1`，则只执行一次
+- 若 [`MaxAttempts`](retry.go:13) `= 2`，则最多执行两次，以此类推
 
 ### 指数退避
 
