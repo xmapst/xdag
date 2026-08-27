@@ -2,6 +2,7 @@ package xdag
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -12,13 +13,26 @@ type RetryPolicy struct {
 	MaxInterval time.Duration `json:"maxInterval" yaml:"maxInterval"`
 	MaxAttempts int64         `json:"maxAttempts" yaml:"maxAttempts"`
 	Multiplier  float64       `json:"multiplier" yaml:"multiplier"`
+	// RetryIf 是可选的重试条件表达式，在每次失败后、真正发起下一次尝试之前求值。
+	// 求值为 false 时立即放弃剩余尝试；空串表示无条件重试，与旧行为一致。
+	//
+	// 表达式中可以使用 Env.Error（最近一次失败的错误信息）与 Env.Attempt，例如：
+	//
+	//	Error matches "timeout|connection reset"
+	//	not (Error contains "invalid argument")
+	//
+	// 该表达式在 New 阶段编译，运行期修改 RetryPolicy 不会生效。
+	RetryIf string `json:"retryIf" yaml:"retryIf"`
 }
 
 type RetryExecutor struct {
-	policy *RetryPolicy
+	policy  *RetryPolicy
+	retryIf Program
+	env     *Env
+	condErr ConditionErrorPolicy
 }
 
-func (d *Dagcuter) newRetryExecutor(policy *RetryPolicy) *RetryExecutor {
+func (d *Dagcuter) newRetryExecutor(policy *RetryPolicy, retryIf Program, env *Env) *RetryExecutor {
 	if policy == nil {
 		// 默认策略：只执行一次
 		policy = &RetryPolicy{
@@ -34,7 +48,12 @@ func (d *Dagcuter) newRetryExecutor(policy *RetryPolicy) *RetryExecutor {
 	if policy.Multiplier <= 0 {
 		policy.Multiplier = 2.0 // 默认乘数为2
 	}
-	return &RetryExecutor{policy: policy}
+	return &RetryExecutor{
+		policy:  policy,
+		retryIf: retryIf,
+		env:     env,
+		condErr: d.opts.condErr,
+	}
 }
 
 // ExecuteWithRetry 带重试的执行函数
@@ -67,6 +86,23 @@ func (r *RetryExecutor) ExecuteWithRetry(ctx context.Context, taskName string, f
 			break
 		}
 
+		// 重试条件：仅在确实还要再试一次时求值
+		if r.retryIf != nil {
+			retry, cerr := r.shouldRetry(ctx, attempt, lastErr)
+			if cerr != nil {
+				if r.condErr == SkipOnConditionError {
+					// 宽松策略：条件坏了不掩盖真正的业务错误，直接放弃重试
+					return fmt.Errorf("task %s failed after %d attempts, last error: %w", taskName, attempt, lastErr)
+				}
+				return fmt.Errorf("task %s: retryIf: %w", taskName,
+					errors.Join(cerr, lastErr))
+			}
+			if !retry {
+				return fmt.Errorf("task %s aborted after %d attempts, retryIf evaluated false, last error: %w",
+					taskName, attempt, lastErr)
+			}
+		}
+
 		// 计算等待时间（指数退避）
 		waitTime := r.calculateBackoff(attempt, r.policy.MaxInterval)
 
@@ -85,6 +121,16 @@ func (r *RetryExecutor) ExecuteWithRetry(ctx context.Context, taskName string, f
 
 	return fmt.Errorf("task %s failed after %d attempts, last error: %w",
 		taskName, maxAttempts, lastErr)
+}
+
+// shouldRetry 求值重试条件。env 按次拷贝，避免多个任务共享同一份可变环境。
+func (r *RetryExecutor) shouldRetry(ctx context.Context, attempt int64, lastErr error) (bool, error) {
+	env := *r.env
+	env.Attempt = attempt
+	if lastErr != nil {
+		env.Error = lastErr.Error()
+	}
+	return r.retryIf.RunBool(ctx, &env)
 }
 
 // calculateBackoff 计算指数退避时间，使用 math.Pow 处理浮点数
