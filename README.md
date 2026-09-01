@@ -1,145 +1,125 @@
 # xdag
 
-[`xdag`](README.md) 是一个基于 Go 实现的轻量级 DAG（Directed Acyclic Graph，有向无环图）任务编排库，用于组织具有依赖关系的任务，并按依赖顺序自动并发执行。
+`xdag` 是一个并发执行有依赖关系的任务图（DAG）的 Go 调度器。
 
-实现的核心特点是：
+- 声明式地描述任务与依赖，调度器负责按依赖关系并发调度，不需要手写 goroutine 编排
+- 调度语义只有一条规则：**一个任务的全部直接依赖都成功，它才会被执行**；没有依赖的根任务不受这条规则约束——除非被取消（`CancelTask`/`Cancel`，或传给 `Execute` 的 ctx 已取消/超时），否则总会执行
+- 失败、跳过、取消都会沿依赖链自动级联传播，不会出现「上游没跑成，下游却被静默执行」的情况
+- 任务级重试，支持指数退避与无限重试
+- 零第三方依赖，只用 Go 标准库
 
-- 基于 [`Task`](task.go:5) 抽象任务节点
-- 基于 [`Validate()`](check.go) 在初始化时校验依赖存在性并检测环
-- 基于 [`Dagcuter`](dag.go) 统一管理任务图、执行顺序和结果汇总
-- 基于 [`Execute()`](dag.go) 启动 DAG 执行
-- 基于 [`RetryPolicy`](retry.go:10) 与 [`ExecuteWithRetry()`](retry.go:41) 提供失败重试能力
-- 基于 [`Conditional`](evaluator.go) 与 [`Evaluator`](evaluator.go) 提供表达式驱动的条件分支
-- 基于 [`State`](state.go:4) 区分成功、跳过、上游跳过与失败四种终态
-
-该项目适合在应用内实现轻量的任务流、步骤依赖执行器、批量异步编排器以及带重试能力的流程调度。
-
----
+xdag 本身不提供条件分支、表达式引擎这类能力——它不对「要不要执行」做任何业务判断。需要按业务状态决定某个任务实际要不要「做事」，属于任务自身的职责，见[业务层条件判断](#业务层条件判断)。
 
 ## 目录
 
-- [项目概览](#项目概览)
-- [功能特性](#功能特性)
 - [适用场景](#适用场景)
 - [安装方式](#安装方式)
 - [快速开始](#快速开始)
 - [核心概念](#核心概念)
 - [执行机制说明](#执行机制说明)
-- [条件分支](#条件分支)
+- [单任务控制](#单任务控制)
+- [并发上限](#并发上限)
+- [整场取消](#整场取消)
+- [执行期观察](#执行期观察)
+- [整体执行状态](#整体执行状态)
+- [进度](#进度)
+- [结构化结果与错误归属](#结构化结果与错误归属)
+- [业务层条件判断](#业务层条件判断)
 - [重试机制说明](#重试机制说明)
 - [结果与执行顺序](#结果与执行顺序)
 - [公开 API](#公开-api)
-- [设计约束与注意事项](#设计约束与注意事项)
 - [项目结构](#项目结构)
 - [许可证](#许可证)
-
----
-
-## 项目概览
-
-项目模块定义见 [`go.mod`](go.mod:1)：
-
-```go
-module github.com/xmapst/xdag
-```
-
-主调度器实现位于 [`Dagcuter`](dag.go)，其职责包括：
-
-- 保存任务集合 `Tasks`
-- 维护任务执行结果 `results`
-- 维护节点入度 `inDegrees`
-- 维护反向依赖表 `dependents`
-- 记录实际完成顺序 `executionOrder`
-- 借助互斥锁和等待组控制并发执行过程
-
-相较于传统串行步骤编排，该项目能够在依赖满足时自动并发执行多个任务，从而提升整体吞吐量。
-
----
 
 ## 功能特性
 
 ### 1. DAG 依赖编排
 
-每个任务可以通过 [`Task.Dependencies()`](task.go:7) 声明依赖项。调度器会根据依赖关系自动构建图，并确保任务只在其所有前置任务成功完成后才开始执行。
+每个任务通过 [`ITask.Dependencies()`](task.go) 声明依赖项。调度器根据依赖关系自动构建图，并确保任务只在其所有直接依赖成功完成后才开始执行。
 
-### 2. 初始化环检测
+### 2. 初始化图校验
 
-在调用 [`New()`](dag.go) 创建执行器时，内部会调用 [`Validate()`](check.go) 校验任务图：依赖必须真实存在，且不能成环。任一条件不满足，初始化立即失败并给出具体的任务名。
+调用 [`New()`](dag.go) 构造执行器时，内部会先冻结每个任务的依赖列表，再据此调用 [`Validate()`](check.go) 校验任务图：依赖必须真实存在，依赖关系不能成环，且每个任务的 `Name()` 必须与它在 map 里的键一致（不一致返回 `ErrTaskNameMismatch`）。任一条件不满足，初始化立即失败并给出具体的任务名/路径。
 
 ### 3. 自动并发执行
 
-所有入度为 `0` 的根任务会首先启动。后续任务在依赖全部完成后，会由 [`runTask()`](dag.go) 递归触发新的 goroutine 执行。
+所有没有依赖的根任务会首先启动。后续任务在其直接依赖全部进入终态后就会被派生到新的 goroutine 上；依赖是否都成功只决定它是真正执行，还是直接落成 `StateSkipped`/`StateCanceled`，无需手动编排。
 
-### 4. 任务级重试
+### 4. 失败/取消级联传播
 
-任务执行失败后，可通过 [`Task.RetryPolicy()`](task.go:9) 返回的 [`RetryPolicy`](retry.go:10) 指定最大尝试次数、退避间隔与倍率。
+任一任务失败或被取消，不会让整场执行崩溃，但会让依赖它的下游任务不再执行——**依赖失败时下游记为 `StateSkipped`，依赖被取消时下游记为 `StateCanceled`**。两者都会继续沿依赖链向后传播，直到抵达不受影响的分支为止。
 
-### 5. 生命周期钩子
+### 5. 任务级重试
 
-任务在执行前后分别会调用：
+任务执行失败后，可通过 [`ITask.RetryPolicy()`](task.go) 返回的 [`RetryPolicy`](retry.go) 指定最大尝试次数、初始等待间隔、退避倍率与上限，支持显式配置为无限重试。
 
-- [`Task.PreExecution()`](task.go:11)
-- [`Task.PostExecution()`](task.go:15)
+### 6. 生命周期钩子
 
-这使得你可以很方便地注入日志、监控、埋点、审计和失败记录逻辑。
+任务在每次尝试执行前后分别会调用：
 
-### 6. 统一结果汇总
+- [`ITask.PreExecution()`](task.go)
+- [`ITask.PostExecution()`](task.go)
 
-所有成功执行的任务输出都会被汇总到 [`Execute()`](dag.go) 的返回值中，便于上层调用方统一消费。
+方便注入日志、监控、埋点、审计等横切逻辑。
 
-### 7. 可追踪执行顺序
+### 7. panic 兜底
 
-调用 [`ExecutionOrder()`](dag.go) 可获取任务的**实际完成顺序**，适用于调试和观测执行过程。
+任务体或前后回调发生 panic 不会打垮整个进程，调度器会将其 recover 并转换为本次尝试的失败（`ErrTaskPanic`），按正常重试策略处理。
 
-### 8. 依赖图输出
+### 8. 统一结果汇总与状态查询
 
-调用 [`PrintGraph()`](dag.go) 可打印从根节点开始的依赖链路，便于理解整个 DAG 结构。
+所有成功任务的输出会汇总到 [`Execute()`](dag.go) 的返回值中；[`States()`](query.go) / [`State()`](query.go) 则提供包含跳过、取消、失败在内的完整状态视图。
 
-### 9. 条件分支
+### 9. 可追踪执行顺序与依赖图可视化
 
-分支判断挂在**依赖边**上：任务实现可选接口 [`Conditional`](evaluator.go) 为每条依赖边声明守卫，边失活时该依赖不再参与门禁。所有入边都失活的任务被跳过，但下游调度照常推进。表达式引擎通过 [`WithEvaluator()`](option.go) 注入，官方实现见子包 `xexpr`。详见[条件分支](#条件分支)。
+[`ExecutionOrder()`](graph.go) 给出任务的实际完成顺序；[`WriteGraph(w)`](graph.go) 把依赖图写入任意 `io.Writer`（`PrintGraph()` 是它写 stdout 的薄包装），输出按名字排序因而确定，菱形结构的汇聚点只展开一次、之后以 `...` 引用，不会随层数指数膨胀。
 
-### 10. 重试条件
+### 10. 单任务控制
 
-重试可以通过 [`RetryPolicy.RetryIf`](retry.go) 区分可重试与永久性错误，与边条件共用同一套表达式引擎。
+[`CancelTask()`](control.go)/[`SuspendTask()`](control.go)/[`ResumeTask()`](control.go) 可以在执行期间对某一个任务单独发起取消或挂起，不影响图中其他任务；[`Suspend()`](control.go)/[`Resume()`](control.go) 则挂起/恢复整张图，两路挂起来源互相独立，详见[单任务控制](#单任务控制)。
 
-### 11. 任务状态
+### 11. 整体执行状态
 
-调用 [`States()`](dag.go) / [`State()`](dag.go) 可获取每个任务的终态，区分「跳过」与「失败」，弥补返回结果集只包含成功任务的不足。
+[`Phase()`](phase.go) 用一个值回答「这场执行怎么样」——未开始 / 运行中 / 成功 / 取消 / 失败，运行途中也能问，详见[整体执行状态](#整体执行状态)。
+
+### 12. 并发上限
+
+[`WithMaxConcurrency(n)`](option.go) 限制同时执行的任务数，默认不限。额度按单次尝试占用——被跳过、被取消、在退避等待、被挂起的任务都不占名额，详见[并发上限](#并发上限)。
+
+### 13. 整场取消
+
+[`Cancel(ctx)`](control.go) 取消整张图：取消每个任务的 context 通知任务体，并在 `ctx` 给的宽限期内等待排空，详见[整场取消](#整场取消)。
+
+### 14. 执行期观察
+
+[`WithObserver(fn)`](observer.go) 注册一个回调，每当有任务进入终态时触发一次——它是执行期控制 API 的配套：看不到任务 Y 刚失败，就无从决定要不要取消任务 X。详见[执行期观察](#执行期观察)。
+
+### 15. 进度
+
+[`Progress()`](progress.go) 一次取锁给出各状态的任务计数，适合进度条这类高频轮询，详见[进度](#进度)。
+
+### 16. 结构化结果与错误归属
+
+[`Results()`](query.go) 按任务名给出终态、错误与实际尝试次数。`Execute()` 返回的是 `errors.Join` 聚合，`errors.As` 在上面只会命中 N 个失败中的一个，任务名此前只活在错误文案的字符串里。
 
 ---
 
 ## 适用场景
 
-[`xdag`](README.md) 适合如下场景：
-
-- 多步骤数据处理流水线
-- 业务任务依赖编排
-- 批量异步作业调度
-- 接口聚合与后处理流程
-- 需要失败重试的远程调用任务
-- 一个大任务拆分成多个可并发子任务的场景
-- 应用内部轻量级流程引擎
-
-如果你的业务中存在“前一步结果作为后一步输入”的模式，并且希望在保证依赖正确的前提下尽量并发执行，当前库是比较合适的基础组件。
-
----
+- 有明确先后依赖关系的多步骤业务流程（数据拉取 → 加工 → 汇总 → 通知）
+- 需要部分并发、部分串行执行，且希望框架自动处理并发编排的场景
+- 需要在某个环节失败时，自动跳过下游而不是继续跑出错误结果的场景
+- 需要对外部依赖（网络请求、第三方服务）做统一重试与退避的场景
 
 ## 安装方式
-
-使用 [`go get`](README.md) 安装：
 
 ```bash
 go get github.com/xmapst/xdag
 ```
 
----
+要求 Go 1.27.0 及以上版本——go.mod 里的 `go 1.27.0` 是硬性下限，不是开发环境说明。
 
 ## 快速开始
-
-### 最小示例
-
-三个任务，其中 `summary` 依赖前两个。这一段只用到根包，不需要任何第三方依赖：
 
 ```go
 package main
@@ -147,754 +127,690 @@ package main
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	"github.com/xmapst/xdag"
 )
 
-// DemoTask 是一个最小的 Task 实现。
-type DemoTask struct {
+// demoTask 是一个最小的 ITask 实现。
+type demoTask struct {
 	name string
 	deps []string
-	run  func(input map[string]any) map[string]any
+	run  func(input map[string]any) (map[string]any, error)
 }
 
-func (t *DemoTask) Name() string           { return t.name }
-func (t *DemoTask) Dependencies() []string { return t.deps }
-
-// 返回 nil 表示只执行一次、不重试
-func (t *DemoTask) RetryPolicy() *xdag.RetryPolicy { return nil }
-
-func (t *DemoTask) PreExecution(context.Context, int64, map[string]any)         {}
-func (t *DemoTask) PostExecution(context.Context, int64, map[string]any, error) {}
-
-func (t *DemoTask) Execute(_ context.Context, _ int64, input map[string]any) (map[string]any, error) {
-	return t.run(input), nil
+func (t *demoTask) Name() string           { return t.name }
+func (t *demoTask) Dependencies() []string { return t.deps }
+func (t *demoTask) RetryPolicy() *xdag.RetryPolicy {
+	return &xdag.RetryPolicy{MaxAttempts: 1}
+}
+func (t *demoTask) PreExecution(context.Context, int64, map[string]any)         {}
+func (t *demoTask) PostExecution(context.Context, int64, map[string]any, error) {}
+func (t *demoTask) Execute(_ context.Context, _ int64, input map[string]any) (map[string]any, error) {
+	return t.run(input)
 }
 
 func main() {
-	tasks := map[string]xdag.Task{
-		"fetch-user": &DemoTask{name: "fetch-user",
-			run: func(map[string]any) map[string]any {
-				return map[string]any{"id": 1001, "name": "Tom"}
-			}},
-		"fetch-order": &DemoTask{name: "fetch-order",
-			run: func(map[string]any) map[string]any {
-				return map[string]any{"orderNo": "ORD-001", "amount": 199}
-			}},
-		"summary": &DemoTask{name: "summary", deps: []string{"fetch-user", "fetch-order"},
-			run: func(input map[string]any) map[string]any {
-				return map[string]any{"user": input["fetch-user"], "order": input["fetch-order"]}
-			}},
+	tasks := map[string]xdag.ITask{
+		"fetch-user": &demoTask{
+			name: "fetch-user",
+			run: func(map[string]any) (map[string]any, error) {
+				return map[string]any{"id": 1001, "name": "Tom"}, nil
+			},
+		},
+		"fetch-order": &demoTask{
+			name: "fetch-order",
+			run: func(map[string]any) (map[string]any, error) {
+				return map[string]any{"amount": 199}, nil
+			},
+		},
+		"summary": &demoTask{
+			name: "summary",
+			deps: []string{"fetch-user", "fetch-order"},
+			run: func(input map[string]any) (map[string]any, error) {
+				return map[string]any{
+					"user":  input["fetch-user"],
+					"order": input["fetch-order"],
+				}, nil
+			},
+		},
 	}
 
-	// 任务图本身有问题（成环、悬空依赖、表达式编译失败）才会在这里报错
 	dag, err := xdag.New(tasks)
 	if err != nil {
 		panic(err)
 	}
 
-	// 某个任务失败不会中断整个 DAG，results 里仍有已成功任务的输出，
-	// 所以不要在 err != nil 时直接丢弃 results
 	results, err := dag.Execute(context.Background())
 	if err != nil {
-		fmt.Println("部分任务失败:", err)
+		panic(err)
 	}
 
-	names := make([]string, 0, len(tasks))
-	for name := range tasks {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		fmt.Printf("%-12s %-8s %v\n", name, dag.State(name), results[name])
-	}
+	fmt.Println(results["summary"])
 }
 ```
 
-运行输出：
-
-```text
-fetch-order  success  map[amount:199 orderNo:ORD-001]
-fetch-user   success  map[id:1001 name:Tom]
-summary      success  map[order:map[amount:199 orderNo:ORD-001] user:map[id:1001 name:Tom]]
-```
-
-几个要点：
-
-- `fetch-user` 与 `fetch-order` 无依赖，会并发执行；`summary` 在两者都成功后才启动
-- [`RetryPolicy()`](task.go:9) 返回 `nil` 表示只执行一次，配置重试见[重试机制说明](#重试机制说明)
-- **任务失败不会中断整个 DAG**。[`Execute()`](dag.go) 返回的 `results` 仍然包含已成功任务的输出，`err` 是所有失败任务的聚合，所以不要在 `err != nil` 时直接丢弃 `results`
-- `results` 只收录成功的任务，要区分「跳过」和「失败」得用 [`States()`](dag.go) / [`State()`](dag.go)
-
-### 加上分支判断
-
-在上面的基础上加一个 `notify-vip`，只在订单金额达标时才发通知。相对最小示例只有三处改动：
-
-**一、任务实现可选接口 [`Conditional`](evaluator.go)**，为依赖边声明守卫：
-
-```go
-// NotifyTask 在 DemoTask 之上只多实现一个方法，就获得了分支能力。
-type NotifyTask struct {
-    DemoTask
-}
-
-// Condition 为依赖边 dep -> notify-vip 声明守卫。
-// fetch-order 是 summary 的上游，因而也是本任务的祖先，可以直接引用它的输出。
-func (t *NotifyTask) Condition(dep string) string {
-    return `Output("fetch-order").amount >= 100`
-}
-```
-
-**二、把它加进任务表**：
-
-```go
-"notify-vip": &NotifyTask{DemoTask{name: "notify-vip", deps: []string{"summary"},
-    run: func(map[string]any) map[string]any {
-        return map[string]any{"sent": true}
-    }}},
-```
-
-**三、构建时注入表达式引擎**（`import "github.com/xmapst/xdag/xexpr"`）：
-
-```go
-dag, err := xdag.New(tasks, xdag.WithEvaluator(xexpr.New()))
-```
-
-金额为 `199` 时通知照发；改成 `49`，`notify-vip` 唯一的入边失活，任务被跳过，而 `summary` 完全不受影响：
-
-```text
---- amount=199 ---
-fetch-order  success  map[amount:199 orderNo:ORD-001]
-fetch-user   success  map[id:1001 name:Tom]
-notify-vip   success  map[sent:true]
-summary      success  map[order:map[amount:199 orderNo:ORD-001] user:map[id:1001 name:Tom]]
-
---- amount=49 ---
-fetch-order  success  map[amount:49 orderNo:ORD-001]
-fetch-user   success  map[id:1001 name:Tom]
-notify-vip   skipped  map[]
-summary      success  map[order:map[amount:49 orderNo:ORD-001] user:map[id:1001 name:Tom]]
-```
-
-分支、汇聚、可选依赖的完整模式见[条件分支](#条件分支)。
-
----
+`fetch-user`、`fetch-order` 没有依赖，会作为根任务并发启动；`summary` 依赖二者，会在两个依赖都成功后才执行，收到的 `input` 中包含它们各自的输出。
 
 ## 核心概念
 
-### 1. 任务接口
+### 1. ITask 接口
 
-所有任务都必须实现 [`Task`](task.go:5)：
+调度所需的一切都通过 [`ITask`](task.go) 接口描述：
 
 ```go
-type Task interface {
-    Name() string
-    Dependencies() []string
-    RetryPolicy() *RetryPolicy
-    PreExecution(ctx context.Context, attempt int64, input map[string]any)
-    Execute(ctx context.Context, attempt int64, input map[string]any) (map[string]any, error)
-    PostExecution(ctx context.Context, attempt int64, output map[string]any, err error)
+type ITask interface {
+	Name() string
+	Dependencies() []string
+	RetryPolicy() *RetryPolicy
+	PreExecution(ctx context.Context, attempt int64, input map[string]any)
+	Execute(ctx context.Context, attempt int64, input map[string]any) (map[string]any, error)
+	PostExecution(ctx context.Context, attempt int64, output map[string]any, err error)
 }
 ```
 
-各方法职责如下：
+- `Name()` **必须**与传给 `New()` 的 map 中对应的 key 一致；调度器与全部控制 API 只按 map 的 key 寻址，不一致时 `New()` 直接返回 `ErrTaskNameMismatch`
+- `Dependencies()` 只会在 `New()` 阶段被调用一次并冻结，之后改变其返回值不会生效
+- `RetryPolicy()` 返回 `nil` 等价于 `&RetryPolicy{MaxAttempts: 1}`（失败不重试）
+- `Execute()` 的返回值是一个不透明的 `map[string]any`，原样交给下游任务的 `input`，以及最终的结果集
 
-- [`Name()`](task.go:6)：返回任务名称
-- [`Dependencies()`](task.go:7)：返回依赖任务名列表
-- [`RetryPolicy()`](task.go:9)：返回任务级重试策略
-- [`PreExecution()`](task.go:11)：执行前回调
-- [`Execute()`](task.go:13)：任务主体逻辑
-- [`PostExecution()`](task.go:15)：执行后回调
+### 2. 任务状态
 
-### 2. 可选接口 Conditional
-
-任务可以额外实现 [`Conditional`](evaluator.go) 来声明分支条件，未实现时行为与之前完全一致：
-
-```go
-type Conditional interface {
-    // 依赖边 dep -> 本任务 的守卫；空串表示该边无条件生效
-    Condition(dep string) string
-}
-```
-
-注意 `Condition` 带 `dep` 参数：它是**逐条依赖边**求值的，不是整个任务一个条件。xdag 没有不带参数的节点级条件，分支判断只归属于边，理由见[为什么条件挂在边上](#为什么条件挂在边上)。
-
-### 3. 任务状态
-
-每个任务最终落在 [`State`](state.go:4) 的一种终态上：
+调度语义只有一条规则：**全部直接依赖成功，任务才会被执行**。因此「没有成功」只有三种成因，分别对应三种终态：
 
 | 状态 | 含义 |
 | --- | --- |
-| `StateSuccess` | 执行成功，输出进入结果集 |
-| `StateSkipped` | 条件表达式为 `false`，任务体未执行 |
-| `StateUpstreamSkipped` | 上游未成功（跳过或失败）导致未执行 |
-| `StateFailed` | 执行失败，或条件表达式求值出错 |
+| `StatePending` | 还没有终态。涵盖「在等依赖」「被挂起」和**「正在执行中」**三种情况——调度器不为「运行中」单独设值 |
+| `StateSuccess` | 执行成功，输出已写入结果集，也会作为 input 提供给下游 |
+| `StateSkipped` | 至少一个直接依赖**失败**，或依赖同样因它的依赖未成功而被跳过；任务体完全没有被调用。注意依赖被**取消**时下游记的是 `StateCanceled` 而不是它 |
+| `StateCanceled` | 被取消：整场 `ctx` 取消/超时、`CancelTask`、`Cancel()`。取消沿依赖链原样传播——依赖被取消时下游记的也是它，不是 `StateSkipped` |
+| `StateFailed` | 任务体执行失败——`Execute` 返回了 error，或 `Execute`/前后回调发生 panic，且用尽了 `RetryPolicy` 允许的尝试次数（或错误里包了 `ErrNonRetryable`，重试被提前放弃）。另有两条不经任务体走完的路径也记为它：任务体之外的调度路径 panic（这种 `Attempts` 为 0），以及任务 goroutine 没产出任何结果就退出（`ErrTaskAbandoned`，典型是任务体里 `runtime.Goexit`，`Attempts` 是已经发起过的尝试次数，可能 ≥ 1） |
 
-### 4. 输入参数约定
+没有依赖的根任务不受「依赖必须成功」这条规则约束，除非被 `CancelTask` 单独取消、被 `Cancel()` 整场取消，或传给 `Execute` 的 `ctx` 已经取消/超时，否则总会被执行。
 
-在 [`snapshot()`](dag.go) 中，调度器会将所有依赖任务的输出收集到下游任务的输入参数中。
+由此可得一条性质：**图中出现 `StateSkipped`，就必然存在 `StateFailed`**。因为跳过只可能由失败或跳过引起（取消不产生跳过），沿依赖链上溯每一步都落在这两者里，图无环保证链有限，而链的起点不可能还是跳过——没有依赖就不会被跳过。[`Phase()`](phase.go) 的整场判定正是据此可以完全无视 `StateSkipped`。
 
-例如：
+### 3. 输入参数约定
 
-- 若任务 `C` 依赖 `A` 和 `B`
-- 则 `C` 的 [`Execute()`](task.go:13) 输入中会包含：
-  - `input["A"]`
-  - `input["B"]`
+任务的 `input` 以直接依赖的任务名为 key，值是该依赖 `Execute()` 的返回值；未成功的依赖（跳过/取消/失败）不会出现在 `input` 中。任务只能看到自己的直接依赖，看不到更上游的祖先——需要传递的数据要由中间任务自己在输出里逐层转发。
 
-此外，在 [`executeTask()`](dag.go) 中，当前尝试次数会以显式参数形式传递给 [`PreExecution()`](task.go:11)、[`Execute()`](task.go:13) 和 [`PostExecution()`](task.go:15)。
+**`input` 必须当作只读。** 调度器给每个下游的是一层浅拷贝，所以往 `input[dep]` 这一层写 key 不会串到别人；但嵌套的 `map`/`slice` 仍然与上游的输出、以及其他下游共享同一份底层数据，改它就是跨任务的数据竞争。需要修改就自己复制一份。
 
-其中 [`attempt`](task.go:11) 从 `1` 开始，表示当前是第几次尝试执行该任务。
+对称的另一半：`Execute()` 返回的 `output` 交出去之后就不该再动——它会被分发给全部下游，也会进入 `Execute()` 的结果集。
 
-### 5. 结果缓存
+### 只排序、不传数据的依赖
 
-成功执行后的结果会在 [`commit()`](dag.go) 中写入结果集，后续依赖任务即可通过输入参数访问上游结果。
+依赖同时表达两件事：**执行顺序**和**数据流向**。只要不去读 `input` 里那个 key，声明依赖就退化成纯粹的顺序约束——「我不要你的输出，只要你先跑完」。
 
-### 6. 入度与依赖关系
+```go
+func (t *cleanupTask) Dependencies() []string { return []string{"migrate", "warmup"} }
 
-在 [`New()`](dag.go) 初始化期间，调度器会建立：
+func (t *cleanupTask) Execute(ctx context.Context, _ int64, input map[string]any) (map[string]any, error) {
+	// 压根不碰 input：这里只是要求 migrate 和 warmup 都成功之后才轮到我
+	return nil, t.cleanup(ctx)
+}
+```
 
-- `inDegrees`：每个任务尚未满足的依赖数量
-- `dependents`：每个任务被哪些下游任务依赖
+这也意味着「依赖必须全部成功」这条规则照常适用：上面这个任务在 `migrate` 失败时会被跳过，正是想要的效果。
 
-这两个结构共同决定任务何时可以被调度执行。
+### 4. 结果缓存
 
----
+只有成功任务的输出会被缓存，既用于填充下游的 `input`，也用于 `Execute()` 最终返回的结果集。跳过、取消、失败的任务没有输出可言。
+
+### 5. 入度与依赖关系
+
+`New()` 会为每个任务计算入度（直接依赖数量），并建好反向的「下游」索引。任务进入终态后，调度器会把其全部下游的入度减一，减到 0 的下游立即被调度——这就是并发执行的驱动方式，整个过程不需要额外的调度线程或轮询。
 
 ## 执行机制说明
 
-### 初始化阶段
+### 单任务调度流程
 
-创建 [`Dagcuter`](dag.go) 的入口是 [`New()`](dag.go)。初始化时主要会做以下事情：
+1. 检查这个任务专属的 context（由 `Execute(ctx, ...)` 的 ctx 派生，`Cancel`/`CancelTask` 同样取消它）是否已被取消/超时，是则终态记为 `StateCanceled`——这一步先于依赖判定，所以被点名取消的任务即使依赖也没跑成，记的仍是 `StateCanceled`
+2. 检查全部直接依赖的终态：任一依赖是 `StateCanceled` → 本任务同样记为 `StateCanceled`；否则只要有依赖未成功 → 记为 `StateSkipped`；全部依赖都成功（或没有依赖）→ 进入第 3 步
+3. 按 `RetryPolicy` 反复执行「过挂起门 → 取并发名额 → `PreExecution` → `Execute` → `PostExecution`」，直到成功、用尽尝试次数，或 ctx 被取消（单任务取消/整场取消/父 ctx 取消/超时全部汇到这一个信号）
+4. 写入终态（`StateSuccess`/`StateFailed`/`StateCanceled`），推进下游：把每个下游的入度减一，减到 0 的立即派生新的 goroutine 调度
 
-1. 检查任务数量是否超过 [`MaxTasks`](dag.go)（可用 [`WithMaxTasks()`](option.go) 覆盖）
-2. 校验依赖图，调用 [`Validate()`](check.go)：悬空依赖与环都会在此暴露
-3. 初始化结果集、入度表、反向依赖表、状态表
-4. 遍历所有任务，构建 `inDegrees` 和 `dependents`
-5. 计算每个任务的**传递闭包祖先集合**，用于限定条件表达式的可见范围
-6. 预编译所有边条件与 `RetryIf` 表达式——语法错误、类型错误、越界的任务名引用都在这一步一次性抛出，而不是执行到一半才失败
+终态只写入一次：`Cancel` 宽限期耗尽、放弃等待时会从外部替任务落终态，被抛下的 goroutine 事后返回时的写入会被挡掉。
 
-其中：
+最后一步对全部终态一视同仁——不止成功，跳过、取消、失败同样会推进下游，否则下游的入度永远减不到 0，会被静默挂起。
 
-```go
-var MaxTasks = 150
-```
+### 并发方式
 
-这里的 [`MaxTasks`](dag.go) 默认最大任务数量限制
+每个可以开始调度的任务（根任务，或入度刚好减到 0 的下游）都会在独立的 goroutine 中运行，不需要额外的调度线程；`Execute()` 会阻塞直到全部任务都进入终态。默认不限制同时执行的任务数，需要限制见[并发上限](#并发上限)。
 
-### 启动执行
+### 取消
 
-[`Execute()`](dag.go) 的核心过程：
+`Execute(ctx, ...)` 期间 `ctx` 被取消或超时，尚未完成的任务会陆续以 `StateCanceled` 收尾；整场执行只会上报一条形如 `execution canceled: <cause>` 的错误，避免大量同质噪音淹没真正的根因（那条错误仍会带上最后一次尝试的真实根因）。
 
-1. 创建错误通道 `errCh`
-2. **先收集**所有入度为 `0` 的根任务，再统一派生 goroutine（边遍历边派生会与子任务对 `inDegrees` 的写入冲突）
-3. 为这些根任务启动 goroutine 执行 [`runTask()`](dag.go)
-4. 等待所有任务完成
-5. 聚合所有错误并返回结果
+想在执行期间主动叫停，见[整场取消](#整场取消)与[单任务控制](#单任务控制)——它们同样通过取消任务的 context 生效，与这里是同一条通路。
 
-`Dagcuter` 的入度表在执行过程中会被消费掉，因此不可重复执行，第二次调用返回 [`ErrAlreadyExecuted`](dag.go)。
+## 单任务控制
 
-### 单任务执行流程
-
-[`runTask()`](dag.go) 的逻辑可概括为：
-
-1. 读取任务对象
-2. 调用 [`snapshot()`](dag.go) 在锁内准备输入参数与条件求值环境
-3. 过入边门禁：
-   - 声明了边条件 → 逐条求值，失活的边不参与门禁，生效的边要求上游为 `StateSuccess`
-   - 未声明边条件 → 默认要求所有依赖为 `StateSuccess`
-   - 全部入边失活 → `StateSkipped`；生效的边上游未成功 → `StateUpstreamSkipped`
-4. 需要执行时调用 [`executeTask()`](dag.go) 运行任务
-5. 调用 [`commit()`](dag.go) 写入终态：成功才记录执行顺序与输出
-6. **无论成功、跳过还是失败**，都遍历子节点将入度减一
-7. 若某个子节点入度减为 `0`，则启动新的 goroutine 执行它
-
-第 6 步是分支能力成立的前提：跳过与失败同样要推进下游调度，否则整棵子树会被静默丢弃。
-
-### 实际并发方式
-
-直接通过：
+除了整场执行级别的取消（传给 `Execute(ctx)` 的 `ctx`），`Scheduler` 还提供了在执行期间对**某一个任务**单独操作的方法：
 
 ```go
-go d.runTask(ctx, child, errCh)
+func (d *Scheduler) CancelTask(name string, opts ...CancelOption) error
+func (d *Scheduler) SuspendTask(name string) error
+func (d *Scheduler) ResumeTask(name string) error
+func (d *Scheduler) TaskSuspended(name string) bool
 ```
 
-递归派生新的 goroutine。也就是说，当前并发度主要受任务图结构、就绪任务数量以及外部运行环境影响。
+### 一条通路：全部走 context
 
----
+取消单个任务、取消整张图、父 ctx 取消/超时——**全部通过取消任务专属的 context 生效**，不再有任何旁路信号。这意味着调度器里每一个「尝试之前的等待」（挂起门、并发名额排队、重试退避）都只需要 `select` 一个 `ctx.Done()`。
 
-## 条件分支
+这不只是好看。此前停止信号分散在三条独立通路上，每加一个等待点就要记得把三条都 select 一遍——历史上两个严重 bug 恰恰都是漏了其中一条：整场停止对排在并发闸门上的任务完全失效（200 个任务一个都没拦住），以及被挂起的任务排不空、`Execute` 永久挂起。收敛到一条通路之后，**这个 bug 类别从结构上消失了**。
 
-### 启用方式
+### 取消是协作式的
 
-条件判断由表达式引擎驱动。根包 `xdag` 不直接依赖 expr，引擎放在子包 `xexpr` 中，通过 [`WithEvaluator()`](option.go) 注入：
+`CancelTask` 取消这个任务专属的 context，正在执行的那次尝试同样收到通知——但调度器**仍然等它自己返回**。能不能及时停下取决于任务体检不检查 `ctx`；Go 没有办法叫停一个不配合的 goroutine。
 
-```go
-import (
-    "github.com/xmapst/xdag"
-    "github.com/xmapst/xdag/xexpr"
-)
-
-dag, err := xdag.New(tasks,
-    xdag.WithEvaluator(xexpr.New()),
-    xdag.WithVars(map[string]any{"env": "prod"}),
-)
-```
-
-任务侧实现 [`Conditional`](evaluator.go)，为依赖边声明守卫：
-
-```go
-func (t *NotifyTask) Condition(dep string) string {
-    if dep == "check" {
-        return `Output("check").code == 200`
-    }
-    return "" // 空串表示该边无条件生效
-}
-```
-
-### 为什么条件挂在边上
-
-xdag 只有边条件一个分支判断入口——[`Conditional.Condition(dep)`](evaluator.go) 的签名带 `dep`，每条入边单独求值，没有「整个任务一个条件」的写法。
-
-节点条件回答「这个任务该不该做」，边条件回答「这条依赖算不算数」。后者是更基础的原语：DAG 的调度语义本来就由边定义，把判断放回边上，门禁只需要一条规则，不存在「节点条件是否覆盖上游检查」这类需要额外约定的组合。分支、汇聚、可选依赖都由同一个机制表达。
-
-代价是明确的，请留意：
-
-- **没有依赖的根任务无法附加条件**，因为它没有入边。需要按开关控制入口时，在任务自身的 `Execute()` 中处理，或引入一个显式的前置任务。
-- **节点级的业务谓词需要写在每条入边上**。例如「只在自动部署模式下执行 deploy」，若 deploy 依赖 `build` 和 `approve`，两条边都要带上这个条件；只写一条会导致另一条边仍然生效，任务照常执行。
-
-### 门禁语义
-
-任务被调度时，先过**入边门禁**，通过后才执行任务体：
-
-- 声明了边条件 → 逐条求值。**失活**（求值为 `false`）的边不参与门禁；**生效**（求值为 `true` 或未声明）的边要求上游必须是 `StateSuccess`
-- 未声明任何边条件 → 要求所有依赖成功（默认行为，与旧版本一致）
-- 没有依赖的根任务没有入边，不受门禁约束
-
-门禁的三种结果对应三种终态：
-
-| 结果 | 终态 | 含义 |
-| --- | --- | --- |
-| 通过 | 继续执行 | 至少一条生效的边，且其上游都成功 |
-| 所有入边失活 | `StateSkipped` | 没有任何依赖构成执行本任务的理由 |
-| 生效的边上游未成功 | `StateUpstreamSkipped` | 依赖没跑成 |
-
-被跳过时：
-
-- 任务体不执行，[`Task.Execute()`](task.go:13) 一次都不会被调用
-- 输出不会进入结果集
-- **下游调度照常推进**，子节点入度正常递减
-
-### 常用模式
-
-求值时 `Env.Dep` 是该边的上游任务名，因此一条表达式可以复用到所有边上。
-
-**条件分支**——同一个上游分流到两个互斥的下游：
-
-```go
-// notify-ok
-func (t *NotifyOK) Condition(string) string { return `Output("check").code == 200` }
-// rollback
-func (t *Rollback) Condition(string) string { return `Output("check").code != 200` }
-```
-
-`check` 返回 500 时，`notify-ok` 唯一的入边失活，任务被标记 `StateSkipped`。
-
-**OR 汇聚**——两条分支必有一条被跳过，汇聚节点不能要求全部成功：
-
-```go
-func (t *Report) Condition(string) string { return `Succeeded(Dep)` }
-```
-
-任一上游成功即可执行；全都没成功时所有边失活，`report` 被跳过。
-
-**可选依赖**——某条依赖失败不应拦住本任务：
-
-```go
-func (t *Deploy) Condition(dep string) string {
-    if dep == "notify" {
-        return `Vars["strictNotify"] == true`
-    }
-    return "" // build 边无条件生效
-}
-```
-
-`strictNotify` 为 `false` 时，即使 `notify` 失败，`deploy` 照常执行。
-
-### 表达式环境
-
-表达式在 [`Env`](evaluator.go) 上求值，可用的字段与函数如下：
-
-| 名称 | 类型 | 说明 |
-| --- | --- | --- |
-| `Task` | `string` | 当前任务名 |
-| `Dep` | `string` | 当前依赖边的上游任务名；边条件中恒非空，`RetryIf` 中为空 |
-| `Attempt` | `int64` | 当前尝试次数，仅在 `RetryIf` 中非零 |
-| `Error` | `string` | 最近一次失败的错误信息，仅在 `RetryIf` 中非空 |
-| `Vars` | `map[string]any` | [`WithVars()`](option.go) 注入的全局变量 |
-| `Inputs` | `map[string]map[string]any` | 直接依赖的输出，未成功的依赖不在其中 |
-| `Output(name)` | `map[string]any` | 祖先任务的输出，未成功时为 `nil` |
-| `State(name)` | `string` | 祖先任务状态：`success` / `skipped` / `upstream_skipped` / `failed` |
-| `Succeeded(name)` | `bool` | 祖先任务是否成功 |
-| `Skipped(name)` | `bool` | 祖先任务是否被跳过（含上游跳过） |
-| `Failed(name)` | `bool` | 祖先任务是否失败 |
-
-示例：
-
-```text
-Output("check").code == 200
-Inputs["fetch-user"]["vip"] == true and Vars["env"] == "prod"
-Succeeded(Dep)
-```
-
-### 可见范围限制在祖先集合
-
-`Output()` / `State()` 等函数只能访问**当前任务的传递闭包祖先**，访问其他任务会报错。
-
-这是刻意的约束：非祖先任务在本任务被调度时不保证已经完成，读取它的输出会让求值结果随调度时序漂移，同一张图每次跑出来的结论可能不同。
-
-### 求值出错的处理
-
-默认策略是 [`FailOnConditionError`](option.go)：求值出错视为任务失败。表达式写错和条件不成立是两回事，静默跳过会让问题极难定位。
-
-需要宽松行为时可以切换：
-
-```go
-xdag.New(tasks,
-    xdag.WithEvaluator(xexpr.New()),
-    xdag.WithConditionErrorPolicy(xdag.SkipOnConditionError),
-)
-```
-
-### 编译期校验
-
-所有表达式在 [`New()`](dag.go) 阶段一次性编译完成。[`xexpr.New()`](xexpr/xexpr.go) 默认开启：
-
-- `expr.Env(xdag.Env{})`：以 `Env` 结构体做编译期类型检查，拼错的字段名会被拒绝
-- `expr.AsBool()`：强制表达式结果为 `bool`
-- `expr.MaxNodes(1000)`：限制 AST 规模
-
-因此语法错误、类型错误、未知标识符都会在构建 DAG 时暴露，不会跑到一半才失败。需要调整时可以把额外的 `expr.Option`（来自 `github.com/expr-lang/expr`）传给 [`xexpr.New()`](xexpr/xexpr.go)，它们追加在默认选项之后，可覆盖默认行为：
-
-```go
-import (
-    "github.com/expr-lang/expr"        // 上游库，包名 expr
-    "github.com/xmapst/xdag/xexpr"     // 本项目子包，包名 xexpr
-)
-
-// 收紧 AST 规模上限，并禁用不需要的内置函数
-engine := xexpr.New(
-    expr.MaxNodes(200),
-    expr.DisableBuiltin("now"),
-)
-```
-
-子包取名 `xexpr` 而非 `expr`，就是为了让它和上游库在同一个文件里无需别名即可共存。
-
-> 注意：`Output()` 返回 `map[string]any`，取字段后是动态类型，`AsBool()` 在编译期无法判定，此类错误在求值时抛出。
-
-### 静态引用校验
-
-编译之后还会做一次**引用范围校验**，把越界的任务名引用从运行期错误提前到构建期：
-
-| 写法 | 要求 |
+| 任务当前状态 | `CancelTask` 的效果 |
 | --- | --- |
-| `Output("x")` / `State("x")` / `Succeeded("x")` / `Skipped("x")` / `Failed("x")` | `x` 必须是当前任务的祖先 |
-| `Inputs["x"]` | `x` 必须是当前任务的**直接依赖**，否则运行期恒为 `nil` |
+| 待执行 / 下轮重试 / 挂起中 | 100% 有效，任务体一次都不会（再）被调用 |
+| 正在执行中 | 通知到，但等它返回 |
 
-```text
-task c: edge condition a -> c "Output(\"b\").x == 2" references "b", which is not an ancestor of c
-task c: edge condition b -> c "Inputs[\"a\"][\"x\"] == 1" uses Inputs["a"], but "a" is not a direct dependency of c
-```
+只要这次尝试确实因取消而中止，终态就记为 `StateCanceled`、错误带 `ErrTaskCanceled`，并按现有规则级联到下游。任务体无视 `ctx` 把活干完并返回成功时，终态仍是 `StateSuccess`——这正是协作式取消的含义。
 
-该校验对边条件与 `RetryIf` 一视同仁。
+想让整张图**不等**在飞的任务、到点就替它们落终态放行下游，用 `Cancel(ctx)`——`ctx` 就是那个宽限期，见[整场取消](#整场取消)。库不提供「只强杀一个任务」：那需要抛下一个仍然活着的 goroutine，而它如果既不检查 `ctx` 又永不返回，就是永久泄漏。
 
-实现方式是遍历编译后的 AST 收集字面量引用，能力通过可选接口 [`Referencer`](evaluator.go) 暴露：自定义的 `Evaluator` 不实现它也能正常工作，只是拿不到这层检查。
+### 附上自己的取消原因
 
-> 只有**字面量**参数能被静态判定。`Output(Dep)`、`Succeeded(Task)` 这类动态引用会跳过静态检查，由 `Env` 在运行期兜底。
-
-### 完整示例
+`CancelTask` 与 `Cancel` 都接受可选的 `WithCause`：
 
 ```go
-tasks := map[string]xdag.Task{
-    "check": &BranchTask{name: "check"},
-    "notify-ok": &BranchTask{name: "notify-ok", deps: []string{"check"},
-        edgeConds: map[string]string{"check": `Output("check").code == 200`}},
-    "rollback": &BranchTask{name: "rollback", deps: []string{"check"},
-        edgeConds: map[string]string{"check": `Output("check").code != 200`}},
-    "report": &BranchTask{name: "report", deps: []string{"notify-ok", "rollback"},
-        edgeConds: map[string]string{
-            "notify-ok": `Succeeded(Dep)`,
-            "rollback":  `Succeeded(Dep)`,
-        }},
-}
+var errKilledByUser = errors.New("killed by user")
 
-dag, _ := xdag.New(tasks, xdag.WithEvaluator(xexpr.New()))
-_, _ = dag.Execute(context.Background())
-
-for name, state := range dag.States() {
-    fmt.Printf("%-10s %s\n", name, state)
-}
-// check      success
-// notify-ok  skipped
-// report     success
-// rollback   success
+dag.CancelTask("build", xdag.WithCause(errKilledByUser))
 ```
 
-可运行版本见 [`example_test.go`](example_test.go) 中的 `Example_conditionalBranch` 与 `Example_edgeCondition`。
+cause 会被 `context.Cause` 透给任务体，也会进入这个任务终态的错误里。库的哨兵**不会**被它替换掉，两者同时成立：
 
----
+```go
+err := dag.Results()["build"].Err
+errors.Is(err, xdag.ErrTaskCanceled) // true —— 发生了什么
+errors.Is(err, errKilledByUser)      // true —— 为什么
+```
+
+哨兵回答「发生了什么」，cause 回答「为什么」。「为什么」是调用方的业务语义，不该让库为每一种原因发明一个哨兵——那样每加一种业务原因，库就得跟着发一个版本。不传 `WithCause` 时行为与不带它完全一致。
+
+### 重复调用
+
+对运行中的任务取消可以重复；对已经处于终态的任务做任何控制，一律返回 `ErrTaskAlreadyDone`：
+
+```go
+// 运行中
+dag.CancelTask("a")  // nil
+dag.CancelTask("a")  // nil ——取消不让任务立刻终态，第二次依然有意义
+
+// 已经跑完
+dag.CancelTask("done")  // ErrTaskAlreadyDone
+```
+
+三个控制方法对未知任务名一律返回 `ErrUnknownTask`。
+
+### 挂起
+
+`SuspendTask` 让任务停在下一个「尝试之前」的检查点上——**任务还没开始第一次尝试**，或**上一次尝试失败、正准备重试**。它打不断已经在进行中的单次 `Execute()` 调用：Go 没有中途冻结一个正在运行的 goroutine 的机制，这是刻意的取舍，而不是遗漏。
+
+挂起是**无限期**的，除了 `ResumeTask` 之外只有取消能叫醒它（都走 `ctx`）。`SuspendTask`/`ResumeTask` 可以在同一个任务上反复交替调用。
+
+还有一路**整场挂起**：
+
+```go
+func (d *Scheduler) Suspend()
+func (d *Scheduler) Resume()
+func (d *Scheduler) Suspended() bool
+```
+
+它按住整张图里所有尚未开跑的任务，生效位置与 `SuspendTask` 完全相同。
+
+两路来源**互相独立**，任一为真即挂起：用户单独挂起了步骤 B，随后又挂起整场，之后恢复整场——**B 必须还挂着**。用一个布尔量表示「挂没挂」做不到这一点，整场恢复会顺手把 B 也放行，用户会看见一个自己明明按住了的步骤莫名跑了起来。
+
+一个已经注定要被跳过的任务（它的某个依赖失败了）即使被挂起过，也会正常落在 `StateSkipped`，不会卡在挂起等待上——依赖判定发生在挂起检查之前。
+
+### 可用窗口从 New 就开始
+
+这些方法在 `New()` 之后、`Execute()` 之前就可以调用。「预取消」会在 `Execute()` 开始时立即兑现，任务一被调度就直接落在 `StateCanceled`，任务体一次都不会被调用；「预挂起」则确定性地拦在第一次尝试之前，不需要和调度抢时序。
+
+业务层在构图之后、启动之前就已经知道某一步该取消（配置关掉了、用户点了取消），不必等 `Execute()` 跑起来才能表达。
+
+### 示例
+
+```go
+dag, err := xdag.New(tasks)
+if err != nil {
+	return err
+}
+
+// Execute 之前：此刻就知道这一步该跳过
+if cfg.SkipNotify {
+	_ = dag.CancelTask("notify")
+}
+
+go func() { results, err = dag.Execute(ctx) }()
+
+// 执行期间：从另一个 goroutine 控制
+_ = dag.SuspendTask("slow-step")
+// ... 稍后 ...
+_ = dag.ResumeTask("slow-step")
+
+// 掐掉某个任务的重试风暴，但等它手头这次跑完
+_ = dag.CancelTask("flaky-step")
+
+// 整张图都不等了：给一个宽限期，到点替没落定的任务判终态、放行下游
+gctx, gcancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer gcancel()
+_ = dag.Cancel(gctx)
+```
+
+## 并发上限
+
+xdag 的调度模型是「入度减到 0 就立即派生一个 goroutine」，默认不限制同时执行的任务数。一张宽图会在 `Execute()` 的第一瞬间同时派生出全部根任务——goroutine 本身不是问题（几百个对 Go 运行时微不足道），问题在**进程外**：几十上百个并发请求瞬间打到同一个下游，连接池耗尽、对端限流。
+
+```go
+dag, err := xdag.New(tasks, xdag.WithMaxConcurrency(8))
+```
+
+传 0 或负数表示不限制，也就是默认行为。
+
+### 额度按单次尝试占用
+
+这是落点上的关键取舍，直接决定会不会把自己饿死：
+
+| 情形 | 占名额吗 |
+| --- | --- |
+| 正在执行任务体（含 `PreExecution`/`PostExecution`） | 占 |
+| 因依赖没跑成而被跳过、或被取消 | 不占——它们根本不会执行 |
+| 两次重试之间的退避等待 | 不占 |
+| 被 `SuspendTask` 挂起、停在挂起门上 | 不占 |
+| 等待名额期间整场被取消 | 立即放弃等待，不会死等 |
+
+如果闸门包住的是「整个任务」而不是「单次尝试」，一个配了 `InfiniteAttempts` 的任务会在退避期间永久霸占一个名额，一个被挂起的任务同样——上限设成 1 时整张图就此停摆。
+
+### 嵌套的乘法效应
+
+如果某个任务在自己的 `Execute()` 里又构造了一个 `Scheduler`，外层任务占着一个名额的同时内层还有自己独立的上限，实际并发是**两者相乘**，不是外层那个数。
+
+## 整场取消
+
+[`Cancel(ctx)`](control.go) 取消整张图的执行：
+
+```go
+func (d *Scheduler) Cancel(ctx context.Context, opts ...CancelOption) error
+```
+
+它做三件事——取消每个任务专属的 context（正在执行的任务体因此会收到取消通知）、不再让任何新的尝试开始、然后在 `ctx` 给的宽限期内等待排空。
+
+### ctx 是宽限期，不是执行本身的 context
+
+- 宽限期内全部任务落定 → 返回 `nil`，此时 `Execute()` 已经返回，`States()`/`Results()`/`Phase()` 都是最终值
+- 宽限期耗尽仍有任务没落定 → 替它们落终态、放行下游，让 `Execute()` 得以返回，然后返回 `ctx.Err()`
+
+```go
+go func() { results, err = dag.Execute(execCtx) }()
+
+<-shutdownSignal
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := dag.Cancel(ctx); err != nil {
+	log.Printf("宽限期内没排空，已强制收尾: %v", err)
+}
+```
+
+⚠️ **代价要认**：宽限期耗尽后被抛下的任务 goroutine 仍然活着——Go 没有办法杀死一个不肯响应 `ctx` 的 goroutine。任务体如果既不检查 `ctx` 又永不返回，那就是永久泄漏。想避免就给足宽限期，或者把任务体写成尊重 `ctx` 的。
+
+`Execute()` 还没开始就调用则立即返回 `nil`，并且整张图一个任务都不会执行。可以重复调用，也可以并发调用。`Canceled()` 用于查询是否已经发起过取消。`WithCause` 同样适用，见[附上自己的取消原因](#附上自己的取消原因)。
+
+### 与其他叫停方式的关系
+
+| 想要的效果 | 用什么 |
+| --- | --- |
+| 停整张图，等在飞的收尾，超时强制收 | `Cancel(ctx)` |
+| 停整张图，一直等到在飞的自己返回 | `Cancel(context.Background())` |
+| 只取消一个任务，等它自己返回 | `CancelTask(name)` |
+| 按住整张图，之后还要松开继续 | `Suspend()` / `Resume()` |
+| 停整张图，原因走 context 自己那套（同样等在飞的自己返回） | 取消传给 `Execute()` 的那个 `ctx` |
+
+⚠️ **绝对不要在观察者回调里直接调用 `Cancel`**：它要等 `Execute()` 返回，而 `Execute()` 在等这个回调，**必然死锁**。从回调里发起停止就别等它——`go func() { _ = dag.Cancel(ctx) }()`。
+
+## 执行期观察
+
+轮询 `States()` 只能看到当前快照，看不到「刚刚发生了什么」。[`WithObserver(fn)`](observer.go) 在每个任务进入终态时触发一次回调：
+
+```go
+dag, err := xdag.New(tasks, xdag.WithObserver(func(ev xdag.Event) {
+	metrics.Observe(ev.Task, ev.State.String(), ev.Attempts)
+}))
+```
+
+`Event` 携带任务名与该任务的 `TaskResult`（`State`/`Err`/`Attempts`）。每个任务恰好触发一次，包括被跳过、被取消、失败的。
+
+### 契约
+
+这几条都是硬约束，不是建议：
+
+- **回调绝对不能阻塞。** `Execute()` 会等待每一个回调返回，回调卡住等于整场执行挂起，没有超时也没有兜底。尤其不要在回调里等任何「要等 `Execute()` 返回之后才会满足」的条件——往一个无缓冲 channel 里发事件、再在 `Execute()` 之后去收，会直接吊死。
+- **查询是安全的**（`States`/`Results`/`Progress`/`Phase`/`State`/`ExecutionOrder`/`TaskSuspended`/`Suspended`/`Canceled`/`WriteGraph`）：回调不持有 `d.mu`，这些方法只是各自短暂取一次锁。
+- **不等待的控制方法**在回调里调用也安全：`CancelTask`/`SuspendTask`/`ResumeTask` 对刚落终态的这个任务会返回 `ErrTaskAlreadyDone`；`Suspend`/`Resume` 是整场作用域、没有返回值，不受单个任务的终态影响，对下游是否来得及生效取决于下面那条事件时序——需要确定性就别在回调里做控制。
+- ⚠️ **绝对不要在回调里直接调用 `Cancel`**：它要等 `Execute()` 返回，而 `Execute()` 在等这个回调，**必然死锁**。要从回调里发起取消就别等它——`go func() { _ = dag.Cancel(ctx) }()`，或者只把决定投递出去、由外面那条主线去调。
+- **回调会被并发调用**，实现必须自己保证并发安全。
+- **事件顺序不保证与因果顺序一致。** 事件在释放调度锁之后触发，而下游任务在锁内就已经被派生——一个下游的事件完全可能先于它上游的事件到达。需要确定的完成顺序请用 `ExecutionOrder()`。
+- **回调只观察，不参与调度决策。** 它没有返回值，做什么都不改变任务终态。
+- **回调要快。** 它不阻塞别的任务提交终态（那些在锁内已经完成），但 `Execute()` 要等它返回。要做 I/O 请自己异步化，且异步化的那一端不能反过来依赖 `Execute()` 已经返回。
+
+回调里的 panic 会被接住并转成 `ErrObserverPanic` 汇入 `Execute()` 的返回值（错误是一个 `*ObserverPanicError`，`errors.As` 可取到 panic 值与调用栈）。它与任务体 panic 的 `*PanicError` **刻意不共用类型**：后者的 `errors.Is` 认 `ErrTaskPanic`，混用会让「观察者炸了」被误报成「任务炸了」——而那个任务往往刚刚成功——观察者是调用方代码，出问题不该打垮进程，也不该被静默吞掉。任务终态不受影响，触发回调时它早已落定。
+
+为什么是「锁外触发」而不是「锁内触发」：`d.mu` 是全图唯一一把锁且不可重入，锁内回调时调用方只要碰一下 `States()` 就会自锁死。代价是上面那条顺序不保证，换来的是一个慢回调只拖住自己这个 goroutine。
+
+## 整体执行状态
+
+`State(name)`/`States()` 回答「这个任务怎么样」，[`Phase()`](phase.go) 回答「这场执行怎么样」：
+
+```go
+func (d *Scheduler) Phase() Phase
+```
+
+| Phase | 含义 |
+| --- | --- |
+| `PhasePending` | 还没有调用过 `Execute` |
+| `PhaseRunning` | `Execute` 进行中且尚未收尾。注意它并不等价于「还有任务没进终态」：最后一个任务落定之后、`Execute` 组装完返回值之前有一个窗口，此时全部任务已终态而 `Phase` 仍是 `running`——这是刻意的，见下方「不提前给出终值」 |
+| `PhaseSuccess` | 全部任务都成功（空任务表同样落在这里） |
+| `PhaseCanceled` | 没有任务失败，但至少一个任务被取消 |
+| `PhaseFailed` | 至少一个任务失败 |
+
+`Phase` 只沿 `PhasePending → PhaseRunning → 三个终值之一` 单向推进，永不回退。
+
+**不提前给出终值**：终值在 `Execute()` 的 defer 里统一结算，因此「最后一个任务落定」到「`Phase` 变成终值」之间存在一个窗口，期间 `Progress().Done() == Total` 而 `Phase()` 仍是 `running`。这是刻意的取舍——它换来的保证是：一旦 `Phase().Done()` 为真，`States()`/`Results()`/`ExecutionOrder()` 与 `Execute()` 的返回值就全都已经定型，中间不留假阳性。要判断「任务是不是都跑完了」请用 `Progress()`，`Phase()` 回答的是「这场执行结束了没有、结果如何」。
+
+### 为什么是独立类型而不是复用 State
+
+`State.Done()` 定义为 `s != StatePending`，而 `CancelTask`/`SuspendTask`/`ResumeTask` 全都靠它拒绝已结束的任务。往 `State` 里加一个「运行中」的值，会让这几个方法对**活着的**任务返回 `ErrTaskAlreadyDone`。两个枚举的取值集合本来也不同：`PhaseRunning` 在任务级不存在，`StateSkipped` 在整场级不可能出现。
+
+### 判定口径
+
+这是库钉死的承诺，不是实现细节：
+
+- 任一任务 `StateFailed` → `PhaseFailed`
+- 否则任一任务 `StateCanceled` → `PhaseCanceled`
+- 否则 → `PhaseSuccess`
+
+**失败优先于取消**：调度器已经把「执行途中被取消打断」判成了 `StateCanceled`，所以残留下来的 `StateFailed` 是调用方事先并不知道的真实故障，而取消是调用方自己发起的、本来就知道的事——先报它不知道的那一件。注意这与依赖判定里「依赖为 `StateCanceled` 时压过 `StateSkipped`」方向相反：那里回答「我为什么没跑」取最近因，这里回答「这场健不健康」取最重症。
+
+**`StateSkipped` 不参与判定**，因为「有跳过而没有失败」的终局不存在：跳过只可能由某个直接依赖处于 `StateSkipped` 或 `StateFailed` 引起（依赖是 `StateCanceled` 时会被判成 `StateCanceled`），而根任务永远执行、图又无环，沿依赖链上溯必然终止在一个 `StateFailed` 上。
+
+**被挂起而停滞的执行报告 `PhaseRunning`**：调度器只知道「还没跑完」，无法知道「跑不完了」——任务体自己阻塞、配了无限重试、和被挂起，这三者在调度器看来完全一样。要区分停滞原因，遍历 `States()` 的 key 逐个调 `TaskSuspended`。
+
+## 进度
+
+[`Progress()`](progress.go) 返回一份进度快照：
+
+```go
+type Progress struct {
+	Total    int // 任务总数，执行全程不变
+	Pending  int // 尚未进入终态：在等依赖、被挂起、或正在执行中
+	Success  int
+	Skipped  int
+	Canceled int
+	Failed   int
+}
+
+func (p Progress) Done() int      // Total - Pending
+func (p Progress) Ratio() float64 // 已进入终态的占比 [0,1]；空图为 1
+func (p Progress) String() string // "4/5 done (success 2, skipped 1, canceled 0, failed 1)"
+```
+
+各字段之和恒等于 `Total`，快照在取锁那一瞬间自洽。
+
+### 为什么给计数而不是一个百分比
+
+计数是**无观点的原始事实**。「什么算完成」各家口径不同——跳过算不算数？取消算不算失败？给出计数，任何口径调用方都能自己推导；只暴露一个百分比，就等于替调用方把口径定死了。`Done()`/`Ratio()` 只是最常用那一种口径的便利方法。
+
+### 为什么不用 States() 自己数
+
+能数，但 `States()` 每次都要复制一整张 map。进度条 10Hz 刷新一张 150 个任务的图，那是纯粹的浪费——`Progress()` 只取一次锁、遍历一遍状态表，不分配。需要逐个任务的状态才用 `States()`。
+
+执行期间高频轮询是安全的，这正是它的设计用途。
+
+## 结构化结果与错误归属
+
+`Execute()` 返回的 error 是 `errors.Join` 聚合，`errors.As` 在上面只会命中 N 个失败中的一个，任务名只活在错误文案的字符串里。[`Results()`](query.go) 按任务名给出结构化结果：
+
+```go
+type TaskResult struct {
+	State    State // 终态
+	Err      error // 上报进聚合错误的那个 error；成功与被跳过的任务为 nil
+	Attempts int64 // 调度器发起过的尝试次数；一次都没发起过的任务为 0
+}
+
+func (d *Scheduler) Results() map[string]TaskResult
+```
+
+它刻意**不包含 output**——那已经在 `Execute()` 的返回值里了，存两份等于两个真相来源。这里只放调度器独家掌握、调用方从 `ITask` 接口这一侧原理上拿不到的信息：被跳过的任务、以及一次尝试都没发起过就被取消的任务，`Pre`/`Execute`/`PostExecution` 一次都不会触发，任务自己什么也看不到；执行途中被取消的任务则已经触发过；`Attempts` 此前也只存在于错误文案里。
+
+`Err` 为 `nil` 的情形比「成功」多：被跳过的任务、被上游级联取消的任务（带 `Err` 的是最初被 `CancelTask` 点名的那个），以及整场取消时除第一个命中者之外、且最后一次尝试没留下自身错误的任务——去重的只是「execution canceled」这层取消原因，任务自己最后一次的错误仍会原样带出；被 `Cancel` 宽限期耗尽强制收尾的任务则一律带 `ErrRunCanceled`。**判断一个任务有没有被取消要看 `State`，不能靠 `Err` 是否为 `nil`。**
+
+`Attempts` 的计数发生在每次尝试调用 `PreExecution` 之前，所以 `PreExecution` 自己 panic 的那次也计入。一次尝试都没发起过的任务为 `0`（被跳过、以及还没开始第一次尝试就被取消的）；但**执行途中或退避等待中被取消**的任务 `Attempts` 会 ≥ 1——不要按「终态是 canceled」反推它一定是 0。
+
+## 业务层条件判断
+
+xdag 不提供条件分支、表达式求值这类能力，也不会替任务判断「要不要做」——它的调度语义只有一条规则：全部依赖成功，任务才执行。
+
+需要按业务状态决定某个任务是否真的要执行某个动作（例如「上游返回失败码就不发通知」），请在任务自身的 `Execute()` 里处理：读取依赖的输出、按业务逻辑判断，并把判断结果写进自己的输出，供下游按需读取。这样调度器眼里这一步仍然是**成功**的，不会被误判为「跳过」，业务层的分支逻辑也完全在任务代码里，可以用 Go 本身写、调试、测试，不需要额外学习一套表达式语言。
+
+```go
+tasks := map[string]xdag.ITask{
+	"check": &demoTask{
+		name: "check",
+		run: func(map[string]any) (map[string]any, error) {
+			return map[string]any{"code": 500}, nil
+		},
+	},
+	"notify": &demoTask{
+		name: "notify",
+		deps: []string{"check"},
+		run: func(input map[string]any) (map[string]any, error) {
+			check, _ := input["check"].(map[string]any)
+			if check["code"] != 200 {
+				// 业务层的分支判断：这一步“不做”，但对调度器而言仍然是成功的
+				return map[string]any{"sent": false, "reason": "check failed"}, nil
+			}
+			return map[string]any{"sent": true}, nil
+		},
+	},
+}
+```
+
+完整可运行版本见 [`example_test.go`](example_test.go) 中的 `Example_businessCondition`。
 
 ## 重试机制说明
 
 ### 重试策略结构
 
-[`RetryPolicy`](retry.go:10) 定义如下：
-
 ```go
 type RetryPolicy struct {
-    Interval    time.Duration
-    MaxInterval time.Duration
-    MaxAttempts int64
-    Multiplier  float64
-    RetryIf     string // 可选的重试条件表达式
+	MaxAttempts int64         // 总执行次数（不是重试次数），零值等同于 1
+	Interval    time.Duration // 第一次重试前的等待时间
+	Multiplier  float64       // 每次重试后等待时间的放大倍数（指数退避）
+	MaxInterval time.Duration // 退避等待时间的上限（同时受全局硬上限 150s 约束）
+	Jitter      float64       // 退避时间的随机抖动幅度 [0,1]，零值=不抖动
 }
 ```
 
-### 默认策略
+### 默认策略与零值语义
 
-在 [`newRetryExecutor()`](retry.go:21) 中：
+`RetryPolicy()` 返回 `nil`，或字段留空，都会在执行前补上默认值：
 
-- 若策略为空，则默认只执行一次
-- 默认重试间隔为 `1s`
-- 默认最大间隔为 `30s`
-- 默认倍率为 `2.0`
-- [`MaxAttempts`](retry.go:13) 的语义为“总执行次数”而非“重试次数”
-- 若 [`MaxAttempts`](retry.go:13) `<= 0`，则在 [`ExecuteWithRetry()`](retry.go:41) 中无限重试，直到成功或 [`context.Context`](task.go:11) 被取消
-- 若 [`MaxAttempts`](retry.go:13) `= 1`，则只执行一次
-- 若 [`MaxAttempts`](retry.go:13) `= 2`，则最多执行两次，以此类推
+- `MaxAttempts` 的零值等同于 `1`（只执行一次，失败不重试）
+- `Interval` 默认 `1s`
+- `Multiplier` 默认 `2.0`；取值在 `(0, 1)` 区间会让等待时间逐次收敛到 `0` 而非发散，这也是合法用法
+- `MaxInterval` 默认 `30s`，且始终不超过全局硬上限 `150s`
+- `Jitter` 默认 `0`（不抖动）
 
-### 重试条件 RetryIf
-
-默认行为是「只要失败就重试到次数用尽」，这会让永久性错误白白等满退避时间。[`RetryPolicy.RetryIf`](retry.go) 可以区分「可重试」与「不可重试」：
+注意 **`MaxAttempts` 的零值不是无限重试**。需要无限重试必须显式填 [`xdag.InfiniteAttempts`](retry.go)（值为 `-1`）：
 
 ```go
-func (t *DemoTask) RetryPolicy() *xdag.RetryPolicy {
-    return &xdag.RetryPolicy{
-        MaxAttempts: 5,
-        Interval:    time.Second,
-        RetryIf:     `Error matches "timeout|connection reset|5\\d\\d"`,
-    }
+policy := &xdag.RetryPolicy{
+	Interval:    time.Second,
+	MaxAttempts: xdag.InfiniteAttempts,
 }
 ```
 
-求值时机与语义：
-
-- 在每次失败后、**真正发起下一次尝试之前**求值
-- 求值为 `false` → 立即放弃剩余尝试，返回最后一次业务错误
-- 空串 → 无条件重试，与旧行为一致
-- 已经是最后一次尝试时**不求值**，避免无谓开销和误导性的错误信息
-
-表达式环境在分支条件的基础上多了两个字段：
-
-- `Error`：最近一次失败的错误信息（任务返回的原始错误，未经调度器包装）
-- `Attempt`：当前是第几次尝试，从 `1` 开始
-
-```text
-Error matches "timeout|connection reset"
-not (Error contains "invalid argument")
-Attempt < 3 or Vars["aggressive"] == true
-```
-
-> 正则里的转义要注意两层：expr 的双引号字符串会处理转义序列，`"5\d\d"` 中的 `\d` 必须写成 `\\d`。
-> 上面示例的 Go 侧用的是反引号原始字符串，所以源码里就是 `5\\d\\d`。
-> 从 YAML/JSON 读配置时可以改用 expr 自己的反引号原始字符串，写作 `` Error matches `5\d\d` ``，无需二次转义。
-
-`RetryIf` 与分支条件共用同一套引擎，因此同样享受构建期编译与静态引用校验；同样需要通过 [`WithEvaluator()`](option.go) 配置引擎。
-
-> 该表达式在 [`New()`](dag.go) 阶段读取并编译，运行期再修改 `RetryPolicy` 不会生效。
-
-求值出错时遵循 [`WithConditionErrorPolicy()`](option.go)：默认返回条件错误与业务错误的聚合；`SkipOnConditionError` 则放弃重试并只返回业务错误，避免坏掉的条件掩盖真正的问题。
+把「只填了 `Interval`」的策略误当成「会一直重试到成功」是常见的陷阱——实际效果是只执行一次。
 
 ### 指数退避
 
-退避时间由 [`calculateBackoff()`](retry.go:87) 计算，公式为：
+第 `attempt` 次失败后的等待时间为 `Interval * Multiplier^(attempt-1)`，并钳制在 `[0, MaxInterval]` 区间内，最后按 `Jitter` 施加抖动。
 
-```text
-backoff = Interval * Multiplier^(attempt-1)
+### 抖动
+
+`Jitter` 取值 `[0,1]`，实际等待时间在 `[backoff*(1-Jitter), backoff]` 之间随机取值。**只向下抖不向上抖**，因此 `MaxInterval` 与硬上限始终是真正的上限；抖动也覆盖被钳到上限的情形——一批同时失败的任务恰恰最容易一起顶在上限上，那里正是最需要打散的地方。
+
+建议在扇出较宽的图里打开：同一层的任务会在同一毫秒被派生，失败后又按同一条确定性公式退避，于是整齐地在同一时刻重试，把下游打成尖峰。这种同步性是拓扑强加的，不是巧合。
+
+### 想给任务限时？用 ctx
+
+库**不提供**任务级的时间预算。要限时就在传给 `Execute()` 的 `ctx` 上加 deadline——它沿 context 树传到每一个任务，语义与 Go 的其余部分完全一致：
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+defer cancel()
+results, err := dag.Execute(ctx)
 ```
 
-并且最终等待时间不会超过 `MaxInterval`。
+这里曾经有过一个 per-task 的 `RetryPolicy.Timeout`，已经删掉。它按墙钟计时，于是**被 `SuspendTask` 按住的任务会在没人看的时候把预算耗光**——用户暂停一个配了 30 分钟预算的步骤去查问题，二十分钟后解挂，步骤直接超时失败、任务体一次都没跑。用户视角那不叫超时，叫「我点了暂停，任务就死了」。而暂停的唯一用途恰恰就是让人介入。
+
+### 不可重试的错误
+
+默认行为是「失败就重试到次数用尽」，但有些错误重试多少次都不会变——参数错误、401、业务规则拒绝。把 [`ErrNonRetryable`](retry.go) 包进返回的 error 里，调度器会立刻放弃剩余次数，既不等待也不再尝试：
+
+```go
+func (t *fetchTask) Execute(ctx context.Context, attempt int64, input map[string]any) (map[string]any, error) {
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, err // 网络错误，值得重试
+	}
+	if resp.StatusCode == http.StatusBadRequest {
+		return nil, fmt.Errorf("bad request: %w", xdag.ErrNonRetryable) // 重试也没用
+	}
+	...
+}
+```
+
+判据是「错误长什么样」而不是「已经试了几次」，判断权因此完整留在业务侧——库只对返回的 error 做一次 `errors.Is`。
 
 ### 执行过程
 
-[`executeTask()`](dag.go) 内部通过 [`ExecuteWithRetry()`](retry.go:41) 包裹真实任务执行。每次尝试都会：
-
-1. 生成当前 [`attempt`](task.go:11)
-2. 调用 [`PreExecution()`](task.go:11)
-3. 调用 [`Execute()`](task.go:13)
-4. 调用 [`PostExecution()`](task.go:15)
-5. 失败且仍有剩余次数时，先求值 `RetryIf`（若已配置），通过后再按退避策略等待并重试
-
----
+1. 每次尝试开始前先过挂起门：被 `SuspendTask` 挂起就停在这里，直到 `ResumeTask` 或取消
+2. 取一个并发名额（配了 `WithMaxConcurrency` 时），再调用 `PreExecution` → `Execute` → `PostExecution`；名额按单次尝试占用，排队期间被取消会立即退出
+3. `Execute` 返回 `nil` 即成功，结束
+4. 返回的 error 里包着 `ErrNonRetryable` 就立刻放弃，既不等待也不再尝试
+5. 否则按退避策略等待后再次尝试，等待期间 context 被取消会立即中断
+6. 用尽尝试次数后返回聚合错误，包含最后一次失败的原因
 
 ## 结果与执行顺序
 
 ### 返回结果
 
-[`Execute()`](dag.go) 返回：
-
-```go
-(map[string]map[string]any, error)
-```
-
-返回结果示例：
-
-```go
-map[string]map[string]any{
-    "fetch-user": {
-        "id":   1001,
-        "name": "Tom",
-    },
-    "summary": {
-        "ok": true,
-    },
-}
-```
-
-说明：
-
-- 第一层 key 是任务名
-- 第二层 map 是任务输出
-- 只有成功执行的任务结果会进入最终结果集
-
-结果集只包含成功的任务，无法区分「被跳过」与「失败」。需要完整视图时用 [`States()`](dag.go)：
-
-```go
-for name, state := range dag.States() {
-    fmt.Printf("%-10s %s\n", name, state) // success / skipped / upstream_skipped / failed
-}
-```
-
-单个任务用 [`State()`](dag.go)：
-
-```go
-if dag.State("rollback") == xdag.StateSkipped { /* ... */ }
-```
+`Execute()` 返回全部**成功**任务的输出（`map[string]map[string]any`，key 为任务名）。跳过、取消、失败的任务不会出现在其中——需要完整视图请用 `States()`。
 
 ### 执行顺序
 
-[`ExecutionOrder()`](dag.go) 返回一个格式化字符串，用于展示**成功执行**的任务的完成顺序，例如：
-
-```text
-1. fetch-user
-2. fetch-order
-3. summary
-```
-
-需要注意：
-
-- 这是**完成顺序**，不是静态拓扑排序
-- 并发任务之间的完成顺序可能不稳定
-- 多次执行时，只要存在并发，就可能出现不同顺序
-- 被跳过与失败的任务不在其中，需要用 [`States()`](dag.go) 查看
+`ExecutionOrder()` 返回全部成功任务按**完成先后**排列的编号列表（文本形式）。这是完成顺序，不是静态拓扑序：并发任务之间谁先谁后并不确定，多次执行同一张图，顺序完全可能不同。
 
 ### 错误聚合
 
-在 [`Execute()`](dag.go) 中，多个任务错误会通过 [`errors.Join()`](dag.go) 聚合返回。
-
-这意味着：
-
-- 调用方可以一次性拿到多个失败任务的信息
-- 当前实现不会因为某个任务失败就主动中止整个 DAG
-- 失败任务的下游会被标记为 `StateUpstreamSkipped`，不会执行，但也不会让调度停摆
-- 如果需要失败即停，可以由业务层配合 [`context.Context`](task.go:11) 实现取消逻辑
-
----
+`Execute()` 返回的 `error` 是 `errors.Join` 聚合：全部**失败**任务的错误、取消的**代表**错误（整场取消只上报一条，级联取消的下游不带错误），以及观察者回调的 panic。可用 `errors.Is`/`errors.As` 检查具体原因，但要按任务名逐个拿错误请用 `Results()`，例如 `errors.Is(err, xdag.ErrTaskPanic)` 判断是否有任务发生过 panic。
 
 ## 公开 API
 
-### 构造与初始化
+### 类型
 
-- [`New(tasks, opts...)`](dag.go)
-  - 创建一个新的 [`Dagcuter`](dag.go)
-  - 校验任务数量、依赖图，并预编译所有条件表达式
+- [`IScheduler`](dag.go)：`Scheduler` 的完整能力（调度 + 查询 + 控制 + 可视化），想在测试里替换真实调度器时按它写签名
+- [`IControl`](dag.go)：控制面接口，`IScheduler` 内嵌了它
+- [`Scheduler`](dag.go)：DAG 执行器实例，由 `New()` 构造
+- [`ITask`](task.go)：参与调度的最小单元，调用方实现的接口
+- [`RetryPolicy`](retry.go)：任务级重试策略
+- [`State`](state.go)：任务终态（`StatePending`/`StateSuccess`/`StateSkipped`/`StateCanceled`/`StateFailed`）
+- [`Progress`](progress.go)：进度快照（各状态计数 + `Done`/`Ratio`）
+- [`Phase`](phase.go)：整场执行的阶段（`PhasePending`/`PhaseRunning`/`PhaseSuccess`/`PhaseCanceled`/`PhaseFailed`）
+- [`TaskResult`](query.go)：单个任务的结果摘要（`State`/`Err`/`Attempts`）
+- [`ObserverPanicError`](observer.go)：观察者回调里的 panic（`Task` 指触发回调的任务，它本身可能是成功的）
+- [`PanicError`](errors.go)：被接住的 panic，用 `errors.As` 取出 `Task`/`Attempt`/`Value`/`Stack`；`Error()` 刻意不含调用栈
+- [`Option`](option.go)：构造 `Scheduler` 时的可选配置项
+- [`Event`](observer.go)：一次任务终态落定的事件（任务名 + `TaskResult`）
 
-### 构建选项
+### 构造与执行
 
-- [`WithEvaluator()`](option.go)：注入表达式引擎
-- [`WithVars()`](option.go)：注入全局变量
-- [`WithConditionErrorPolicy()`](option.go)：条件求值出错时的处理策略
-- [`WithMaxTasks()`](option.go)：覆盖任务数量上限，传 `0` 表示不限制
+- [`New(tasks, opts...)`](dag.go)：校验任务图并构造 `Scheduler`
+- [`(*Scheduler).Execute(ctx)`](dag.go)：驱动全部任务跑完，只能调用一次
+- [`(*Scheduler).States()`](query.go) / [`(*Scheduler).State(name)`](query.go)：查询任务状态
+- [`(*Scheduler).Phase()`](phase.go)：查询整场执行的阶段，见[整体执行状态](#整体执行状态)
+- [`(*Scheduler).Progress()`](progress.go)：查询各状态的任务计数，见[进度](#进度)
+- [`(*Scheduler).Results()`](query.go)：按任务名查询终态/错误/尝试次数，见[结构化结果与错误归属](#结构化结果与错误归属)
+- [`(*Scheduler).ExecutionOrder()`](graph.go)：查询实际完成顺序
+- [`(*Scheduler).WriteGraph(w)`](graph.go)：把依赖图写入 `io.Writer`，输出确定、汇聚点不重复展开
+- [`(*Scheduler).PrintGraph()`](graph.go)：等价于 `WriteGraph(os.Stdout)`
+- [`(*Scheduler).Cancel(ctx, opts...)`](control.go) / [`(*Scheduler).Canceled()`](query.go)：取消整张图（ctx 是宽限期）与查询，见[整场取消](#整场取消)
+- [`(*Scheduler).Suspend()`](control.go) / [`(*Scheduler).Resume()`](control.go) / [`(*Scheduler).Suspended()`](query.go)：挂起/恢复整张图与查询
+- [`(*Scheduler).CancelTask(name, opts...)`](control.go) / [`(*Scheduler).SuspendTask(name)`](control.go) / [`(*Scheduler).ResumeTask(name)`](control.go) / [`(*Scheduler).TaskSuspended(name)`](query.go)：执行期间对单个任务发起取消/挂起/解挂/查询挂起状态，见[单任务控制](#单任务控制)
 
-### 调度相关方法
+### 配置项
 
-- [`Execute()`](dag.go)：执行整个任务图；重复调用返回 `ErrAlreadyExecuted`
-- [`States()`](dag.go)：返回所有任务的状态快照
-- [`State(name)`](dag.go)：返回单个任务的状态
-- [`ExecutionOrder()`](dag.go)：返回成功任务的完成顺序
-- [`PrintGraph()`](dag.go)：输出依赖图
+- [`WithMaxConcurrency(n)`](option.go)：限制同时执行的任务数，传 0 或负数表示不限制（默认）
+- [`WithObserver(fn)`](observer.go)：注册任务终态事件的回调，见[执行期观察](#执行期观察)
+- [`WithCause(err)`](control.go)：给 `Cancel`/`CancelTask` 附上调用方自己的取消原因，见[附上自己的取消原因](#附上自己的取消原因)
 
-### 接口
+### 常量与错误
 
-- [`Task`](task.go:5)：任务抽象
-- [`Conditional`](evaluator.go)：可选，声明依赖边条件（唯一的分支判断入口）
-- [`Evaluator`](evaluator.go)：表达式引擎，把表达式编译成 [`Program`](evaluator.go)
-- [`Program`](evaluator.go)：编译后的表达式，必须并发安全
-- [`Referencer`](evaluator.go)：`Program` 的可选扩展，报告静态引用的任务名，供构建期范围校验
+- [`InfiniteAttempts`](retry.go)：`RetryPolicy.MaxAttempts` 的无限重试标记
+- `ErrCircularDependency` / `ErrUnknownDependency`：来自 [`Validate()`](check.go) 的图校验错误
+- `ErrTaskNameMismatch`：任务的 `Name()` 与它在 tasks 里的键不一致，`New()` 直接拒绝构造
+- `ErrAlreadyExecuted`：对同一个 `Scheduler` 调用了不止一次 `Execute`
+- `ErrTaskPanic`：调度器接住了一次与该任务有关的 panic（配合 `PanicError` 使用）
+- `ErrRunCanceled`：任务是因为整张图被 `Cancel()` 取消而结束的
+- `ErrTaskCanceled`：任务被 `CancelTask()` 取消
+- `ErrObserverPanic`：`WithObserver` 注册的回调发生了 panic
+- `ErrTaskAbandoned`：任务 goroutine 没产出结果就终止了（多为任务里调用了 `runtime.Goexit`，例如 `t.Fatal`）
+- `ErrNonRetryable`：由业务包进返回的 error，声明这次失败不必再重试
+- `ErrUnknownTask`：`CancelTask`/`SuspendTask`/`ResumeTask`/`TaskSuspended` 收到了不存在的任务名
+- `ErrTaskAlreadyDone`：对一个已经处于终态的任务调用了 `CancelTask`/`SuspendTask`/`ResumeTask`
 
-### 静态分析辅助
+### 辅助函数
 
-供自定义 `Evaluator` 实现 [`Referencer`](evaluator.go) 时使用：
-
-- [`Reference`](evaluator.go) / [`RefKind`](evaluator.go)：一处任务名引用及其可见范围
-- [`IsAncestorFunc()`](evaluator.go)：判断标识符是否为以任务名为参数的 `Env` 函数
-- [`InputsField`](evaluator.go)：`Env` 中按依赖名索引的字段名
-
-### 辅助函数与错误
-
-- [`Validate()`](check.go)：校验依赖存在性与无环，返回带任务名的错误
-- [`HasCycle()`](check.go)：仅检查环，已废弃，建议改用 `Validate()`
-- `ErrCircularDependency` / `ErrUnknownDependency` / `ErrNoEvaluator` / `ErrAlreadyExecuted`
-
-### 表达式引擎子包
-
-- [`xexpr.New(opts...)`](xexpr/xexpr.go)：基于 `github.com/expr-lang/expr` 的 `Evaluator` 实现
-
----
+- [`Validate(tasks)`](check.go)：独立于 `New()` 单独校验任务图
 
 ## 项目结构
 
-```text
+```
 .
-├── README.md            # 项目说明文档
-├── LICENSE              # 许可证
-├── go.mod               # 模块定义
-├── go.sum               # 依赖校验文件
-├── dag.go               # DAG 调度器核心实现
-├── task.go              # Task 接口定义
-├── state.go             # 任务状态定义
-├── evaluator.go         # 边条件的接口与求值环境
-├── option.go            # 构建选项
-├── retry.go             # 重试策略与执行器
-├── check.go             # 图校验、环检测、祖先集合
-└── xexpr/               # 基于 expr-lang/expr 的 Evaluator 实现
-    └── xexpr.go
+├── doc.go            # 包文档
+├── dag.go            # 接口定义、Scheduler 结构，以及 New / Execute 的生命周期
+├── schedule.go       # 调度引擎：派生 → 判定 → 执行 → 落终态 → 放行下游
+├── control.go        # 控制面：Cancel / CancelTask / Suspend / Resume / WithCause
+├── taskcontrol.go    # 单任务控制柄：取消用的专属 context 与挂起用的那道门
+├── query.go          # 只读查询面：States / Results / State / Suspended / Canceled
+├── graph.go          # 依赖图的可视化输出
+├── errors.go         # 执行与控制相关的哨兵错误，以及 PanicError
+├── task.go           # ITask 接口定义
+├── state.go          # State 类型与终态定义
+├── phase.go          # Phase 类型与整场执行状态的汇总
+├── progress.go       # Progress 类型与各状态计数
+├── retry.go          # RetryPolicy 与重试驱动
+├── option.go         # 构造期可选配置
+├── check.go          # 依赖图校验（悬空依赖、环检测）
+├── observer.go       # Event 类型与 WithObserver
+├── *_test.go         # 按主题拆分：execute / control / run_suspend / retry /
+│                     #   concurrency / observer / progress / graph /
+│                     #   robustness；共用脚手架在 helpers_test.go，
+│                     #   内部钩子在 export_test.go
+├── example_test.go   # godoc Example，兼作用法示例
+├── go.mod
+└── README.md
 ```
 
-关键文件说明：
+每个 `.go` 文件开头都有一行说明它装什么。按职责找代码时可以先看那一行，而不必通读整个文件。
 
-- [`dag.go`](dag.go)：定义 [`Dagcuter`](dag.go)、[`New()`](dag.go)、[`Execute()`](dag.go) 等核心逻辑
-- [`task.go`](task.go)：定义任务抽象 [`Task`](task.go:5)
-- [`state.go`](state.go)：定义任务终态 [`State`](state.go:4)
-- [`evaluator.go`](evaluator.go)：定义 [`Conditional`](evaluator.go)、[`Evaluator`](evaluator.go)、[`Program`](evaluator.go) 与求值环境 [`Env`](evaluator.go)
-- [`option.go`](option.go)：定义 [`Option`](option.go) 及各项构建选项
-- [`retry.go`](retry.go)：定义 [`RetryPolicy`](retry.go:10) 与重试执行逻辑
-- [`check.go`](check.go)：定义 [`Validate()`](check.go)、[`HasCycle()`](check.go) 与祖先集合计算
-- [`xexpr/`](xexpr)：把 expr 依赖隔离在子包，根包保持零第三方依赖
-- [`go.mod`](go.mod)：定义模块路径与依赖
-
----
+xdag 只依赖 Go 标准库，没有任何第三方依赖。
 
 ## 许可证
 

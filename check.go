@@ -1,39 +1,55 @@
+// check.go —— 构图期的校验：依赖是否存在、有没有环、名字对不对得上。
+
 package xdag
 
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
 
 var (
-	// ErrCircularDependency 任务图中存在环。
+	// ErrCircularDependency 任务图中存在环：从某个任务出发，沿依赖边最终能绕回自身。
 	ErrCircularDependency = errors.New("circular dependency detected")
-	// ErrUnknownDependency 任务声明了一个不存在的依赖。
+	// ErrUnknownDependency 任务声明了一个不存在于任务表中的依赖名。
 	ErrUnknownDependency = errors.New("unknown dependency")
 )
 
-// dependenciesOf 安全地取出任务的依赖列表。
-// map 中不存在的 key 会返回 nil 接口，直接调用其方法会 panic，因此这里显式判空。
-func dependenciesOf(tasks map[string]Task, name string) []string {
-	task, ok := tasks[name]
-	if !ok || task == nil {
-		return nil
+// snapshotDeps 把每个任务的依赖列表拷贝一份冻结下来，返回按任务名索引的副本。
+//
+// ITask.Dependencies() 是调用方实现的，返回值既可能是共享切片，也可能每次
+// 调用返回不同结果。校验、入度计算、依赖建边、调度判定如果各自独立调用
+// Dependencies()，用到的就可能不是同一张图——计数与实际递减次数一旦对不上，
+// 任务会永久停在 StatePending，或在依赖尚未完成时被错误地判定。
+// 因此整个 Scheduler 生命周期只在 New 里调用这一次。
+func snapshotDeps(tasks map[string]ITask) map[string][]string {
+	out := make(map[string][]string, len(tasks))
+	for name, task := range tasks {
+		if task == nil {
+			continue
+		}
+		out[name] = append([]string(nil), task.Dependencies()...)
 	}
-	return task.Dependencies()
+	return out
 }
 
-// Validate 校验任务图：依赖必须存在，且不能成环。
-// 相比 HasCycle，它会给出具体的任务名，便于定位问题。
-func Validate(tasks map[string]Task) error {
-	// 1. 悬空依赖
+// Validate 校验任务图：每个任务都必须非 nil、依赖必须都存在于任务表中，
+// 且依赖关系不能成环。校验失败时返回的错误会指出具体是哪个任务、哪条边出的问题。
+func Validate(tasks map[string]ITask) error {
+	return validateGraph(tasks, snapshotDeps(tasks))
+}
+
+// validateGraph 在冻结的依赖快照上做校验，保证看到的与调度器实际使用的是同一张图。
+func validateGraph(tasks map[string]ITask, deps map[string][]string) error {
+	// 1. 悬空依赖：某个任务依赖了任务表里不存在的名字
 	var dangling []string
 	for name, task := range tasks {
 		if task == nil {
 			return fmt.Errorf("task %q is nil", name)
 		}
-		for _, dep := range task.Dependencies() {
+		for _, dep := range deps[name] {
 			if _, ok := tasks[dep]; !ok {
 				dangling = append(dangling, fmt.Sprintf("%s -> %s", name, dep))
 			}
@@ -44,11 +60,11 @@ func Validate(tasks map[string]Task) error {
 		return fmt.Errorf("%w: %s", ErrUnknownDependency, strings.Join(dangling, ", "))
 	}
 
-	// 2. 环检测，DFS 三色法；path 用于还原环上的具体路径
+	// 2. 环检测，DFS 三色法；path 用于还原环上的具体路径，便于报错定位
 	const (
 		white = 0 // 未访问
 		gray  = 1 // 在当前递归栈上
-		black = 2 // 已完成
+		black = 2 // 已完成，不可能再成环
 	)
 	color := make(map[string]int, len(tasks))
 	var path []string
@@ -58,7 +74,7 @@ func Validate(tasks map[string]Task) error {
 	dfs = func(name string) bool {
 		switch color[name] {
 		case gray:
-			// 从 path 中截出环
+			// 撞上了递归栈里的祖先，从 path 中把环截出来
 			for i, n := range path {
 				if n == name {
 					cycle = append(append([]string{}, path[i:]...), name)
@@ -71,96 +87,24 @@ func Validate(tasks map[string]Task) error {
 		}
 		color[name] = gray
 		path = append(path, name)
-		for _, dep := range dependenciesOf(tasks, name) {
-			if dfs(dep) {
-				return true
-			}
+		if slices.ContainsFunc(deps[name], dfs) {
+			return true
 		}
 		path = path[:len(path)-1]
 		color[name] = black
 		return false
 	}
 
+	// 按名字排序后再遍历，保证多个环同时存在时报出的错误稳定可复现
 	names := make([]string, 0, len(tasks))
 	for name := range tasks {
 		names = append(names, name)
 	}
-	sort.Strings(names) // 保证错误信息稳定可复现
+	sort.Strings(names)
 	for _, name := range names {
 		if color[name] == white && dfs(name) {
 			return fmt.Errorf("%w: %s", ErrCircularDependency, strings.Join(cycle, " -> "))
 		}
 	}
 	return nil
-}
-
-// HasCycle 报告任务图中是否存在循环依赖。不存在的依赖会被当作叶子节点忽略。
-//
-// Deprecated: 使用 Validate 获取包含任务名的详细错误。
-func HasCycle(tasks map[string]Task) bool {
-	return errors.Is(cycleOnly(tasks), ErrCircularDependency)
-}
-
-func cycleOnly(tasks map[string]Task) error {
-	const (
-		white = 0
-		gray  = 1
-		black = 2
-	)
-	color := make(map[string]int, len(tasks))
-
-	var dfs func(string) bool
-	dfs = func(name string) bool {
-		if _, ok := tasks[name]; !ok {
-			return false // 悬空依赖当作叶子
-		}
-		switch color[name] {
-		case gray:
-			return true
-		case black:
-			return false
-		}
-		color[name] = gray
-		for _, dep := range dependenciesOf(tasks, name) {
-			if dfs(dep) {
-				return true
-			}
-		}
-		color[name] = black
-		return false
-	}
-
-	for name := range tasks {
-		if color[name] == white && dfs(name) {
-			return ErrCircularDependency
-		}
-	}
-	return nil
-}
-
-// computeAncestors 为每个任务计算传递闭包祖先集合。
-// 调用前必须保证任务图无环且无悬空依赖。
-func computeAncestors(tasks map[string]Task) map[string]map[string]struct{} {
-	result := make(map[string]map[string]struct{}, len(tasks))
-
-	var visit func(string) map[string]struct{}
-	visit = func(name string) map[string]struct{} {
-		if set, ok := result[name]; ok {
-			return set
-		}
-		set := make(map[string]struct{})
-		result[name] = set // 无环，先占位即可，不会被提前读到不完整的值
-		for _, dep := range dependenciesOf(tasks, name) {
-			set[dep] = struct{}{}
-			for a := range visit(dep) {
-				set[a] = struct{}{}
-			}
-		}
-		return set
-	}
-
-	for name := range tasks {
-		visit(name)
-	}
-	return result
 }
