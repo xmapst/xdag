@@ -97,7 +97,7 @@ var ErrRunCanceled = errors.New("run canceled")
 // 但调度器仍然等它自己返回——能不能及时停下取决于任务体检不检查 ctx。
 var ErrTaskCanceled = errors.New("task canceled")
 
-// ErrUnknownTask 表示 CancelTask/SuspendTask/ResumeTask/TaskSuspended
+// ErrUnknownTask 表示 CancelTask/SuspendTask/ResumeTask/SuspendedTask
 // 收到了一个不存在于本次构建的任务表中的任务名。
 var ErrUnknownTask = errors.New("unknown task")
 

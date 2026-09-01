@@ -291,7 +291,7 @@ func (t *cleanupTask) Execute(ctx context.Context, _ int64, input map[string]any
 func (d *Scheduler) CancelTask(name string, opts ...CancelOption) error
 func (d *Scheduler) SuspendTask(name string) error
 func (d *Scheduler) ResumeTask(name string) error
-func (d *Scheduler) TaskSuspended(name string) bool
+func (d *Scheduler) SuspendedTask(name string) bool
 ```
 
 ### 一条通路：全部走 context
@@ -490,7 +490,7 @@ dag, err := xdag.New(tasks, xdag.WithObserver(func(ev xdag.Event) {
 这几条都是硬约束，不是建议：
 
 - **回调绝对不能阻塞。** `Execute()` 会等待每一个回调返回，回调卡住等于整场执行挂起，没有超时也没有兜底。尤其不要在回调里等任何「要等 `Execute()` 返回之后才会满足」的条件——往一个无缓冲 channel 里发事件、再在 `Execute()` 之后去收，会直接吊死。
-- **查询是安全的**（`States`/`Results`/`Progress`/`Phase`/`State`/`ExecutionOrder`/`TaskSuspended`/`Suspended`/`Canceled`/`WriteGraph`）：回调不持有 `d.mu`，这些方法只是各自短暂取一次锁。
+- **查询是安全的**（`States`/`Results`/`Progress`/`Phase`/`State`/`ExecutionOrder`/`SuspendedTask`/`Suspended`/`Canceled`/`WriteGraph`）：回调不持有 `d.mu`，这些方法只是各自短暂取一次锁。
 - **不等待的控制方法**在回调里调用也安全：`CancelTask`/`SuspendTask`/`ResumeTask` 对刚落终态的这个任务会返回 `ErrTaskAlreadyDone`；`Suspend`/`Resume` 是整场作用域、没有返回值，不受单个任务的终态影响，对下游是否来得及生效取决于下面那条事件时序——需要确定性就别在回调里做控制。
 - ⚠️ **绝对不要在回调里直接调用 `Cancel`**：它要等 `Execute()` 返回，而 `Execute()` 在等这个回调，**必然死锁**。要从回调里发起取消就别等它——`go func() { _ = dag.Cancel(ctx) }()`，或者只把决定投递出去、由外面那条主线去调。
 - **回调会被并发调用**，实现必须自己保证并发安全。
@@ -538,7 +538,7 @@ func (d *Scheduler) Phase() Phase
 
 **`StateSkipped` 不参与判定**，因为「有跳过而没有失败」的终局不存在：跳过只可能由某个直接依赖处于 `StateSkipped` 或 `StateFailed` 引起（依赖是 `StateCanceled` 时会被判成 `StateCanceled`），而根任务永远执行、图又无环，沿依赖链上溯必然终止在一个 `StateFailed` 上。
 
-**被挂起而停滞的执行报告 `PhaseRunning`**：调度器只知道「还没跑完」，无法知道「跑不完了」——任务体自己阻塞、配了无限重试、和被挂起，这三者在调度器看来完全一样。要区分停滞原因，遍历 `States()` 的 key 逐个调 `TaskSuspended`。
+**被挂起而停滞的执行报告 `PhaseRunning`**：调度器只知道「还没跑完」，无法知道「跑不完了」——任务体自己阻塞、配了无限重试、和被挂起，这三者在调度器看来完全一样。要区分停滞原因，遍历 `States()` 的 key 逐个调 `SuspendedTask`。
 
 ## 进度
 
@@ -725,8 +725,8 @@ func (t *fetchTask) Execute(ctx context.Context, attempt int64, input map[string
 
 ### 类型
 
-- [`IScheduler`](dag.go)：`Scheduler` 的完整能力（调度 + 查询 + 控制 + 可视化），想在测试里替换真实调度器时按它写签名
-- [`IControl`](dag.go)：控制面接口，`IScheduler` 内嵌了它
+- [`IScheduler`](dag.go)：`*Scheduler` 的**导出方法全集**（调度 + 查询 + 控制 + 可视化）。它不是一层抽象——库内部一处都不引用它，`New()` 返回的是 `*Scheduler`；留着它只为给测试替身一个现成的签名。要实现请**内嵌**（`struct{ xdag.IScheduler }`）而不是平铺 18 个方法：本接口承诺恒等于全集，因此 `Scheduler` 新增方法时它会同步扩容，**不**按破坏性变更对待，内嵌的实现不受影响。这条不变式由 `TestISchedulerMirrorsScheduler` 守着
+- [`IControl`](dag.go)：控制面接口，`IScheduler` 内嵌了它。六个命令（终止/挂起 × 单任务/整张图）外加三个状态回读（`Canceled`/`Suspended`/`SuspendedTask`）——回读跟命令放在一起是有意的，它们读的正是同一格命令写下的东西
 - [`Scheduler`](dag.go)：DAG 执行器实例，由 `New()` 构造
 - [`ITask`](task.go)：参与调度的最小单元，调用方实现的接口
 - [`RetryPolicy`](retry.go)：任务级重试策略
@@ -752,7 +752,7 @@ func (t *fetchTask) Execute(ctx context.Context, attempt int64, input map[string
 - [`(*Scheduler).PrintGraph()`](graph.go)：等价于 `WriteGraph(os.Stdout)`
 - [`(*Scheduler).Cancel(ctx, opts...)`](control.go) / [`(*Scheduler).Canceled()`](query.go)：取消整张图（ctx 是宽限期）与查询，见[整场取消](#整场取消)
 - [`(*Scheduler).Suspend()`](control.go) / [`(*Scheduler).Resume()`](control.go) / [`(*Scheduler).Suspended()`](query.go)：挂起/恢复整张图与查询
-- [`(*Scheduler).CancelTask(name, opts...)`](control.go) / [`(*Scheduler).SuspendTask(name)`](control.go) / [`(*Scheduler).ResumeTask(name)`](control.go) / [`(*Scheduler).TaskSuspended(name)`](query.go)：执行期间对单个任务发起取消/挂起/解挂/查询挂起状态，见[单任务控制](#单任务控制)
+- [`(*Scheduler).CancelTask(name, opts...)`](control.go) / [`(*Scheduler).SuspendTask(name)`](control.go) / [`(*Scheduler).ResumeTask(name)`](control.go) / [`(*Scheduler).SuspendedTask(name)`](query.go)：执行期间对单个任务发起取消/挂起/解挂/查询挂起状态，见[单任务控制](#单任务控制)
 
 ### 配置项
 
@@ -772,7 +772,7 @@ func (t *fetchTask) Execute(ctx context.Context, attempt int64, input map[string
 - `ErrObserverPanic`：`WithObserver` 注册的回调发生了 panic
 - `ErrTaskAbandoned`：任务 goroutine 没产出结果就终止了（多为任务里调用了 `runtime.Goexit`，例如 `t.Fatal`）
 - `ErrNonRetryable`：由业务包进返回的 error，声明这次失败不必再重试
-- `ErrUnknownTask`：`CancelTask`/`SuspendTask`/`ResumeTask`/`TaskSuspended` 收到了不存在的任务名
+- `ErrUnknownTask`：`CancelTask`/`SuspendTask`/`ResumeTask`/`SuspendedTask` 收到了不存在的任务名
 - `ErrTaskAlreadyDone`：对一个已经处于终态的任务调用了 `CancelTask`/`SuspendTask`/`ResumeTask`
 
 ### 辅助函数
@@ -788,7 +788,7 @@ func (t *fetchTask) Execute(ctx context.Context, attempt int64, input map[string
 ├── schedule.go       # 调度引擎：派生 → 判定 → 执行 → 落终态 → 放行下游
 ├── control.go        # 控制面：Cancel / CancelTask / Suspend / Resume / WithCause
 ├── taskcontrol.go    # 单任务控制柄：取消用的专属 context 与挂起用的那道门
-├── query.go          # 只读查询面：States / Results / State / Suspended / Canceled
+├── query.go          # 只读查询面：States / Results / State / Suspended / Canceled / SuspendedTask
 ├── graph.go          # 依赖图的可视化输出
 ├── errors.go         # 执行与控制相关的哨兵错误，以及 PanicError
 ├── task.go           # ITask 接口定义

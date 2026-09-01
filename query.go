@@ -76,7 +76,7 @@ func (d *Scheduler) State(name string) State {
 // Suspended 报告整场执行当前是否处于挂起中。
 //
 // 它回答的是"有没有按下过整场暂停"，不是"当前有没有任务停着"——
-// 后者要遍历 States() 的 key 逐个调 TaskSuspended。
+// 后者要遍历 States() 的 key 逐个调 SuspendedTask。
 func (d *Scheduler) Suspended() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -86,9 +86,14 @@ func (d *Scheduler) Suspended() bool {
 // Canceled 报告是否调用过 Cancel。
 func (d *Scheduler) Canceled() bool { return d.cancelRequested.Load() }
 
-// TaskSuspended 报告某个任务当前是否处于挂起等待中，Execute 之前调用同样
+// SuspendedTask 报告某个任务当前是否处于挂起等待中，Execute 之前调用同样
 // 有效（反映预挂起）。任务名不存在或任务已经处于终态时返回 false。
-func (d *Scheduler) TaskSuspended(name string) bool {
+//
+// 名字读着像名词、返回的却是 bool，这是刻意跟着本包的作用域约定走：整图
+// 不带后缀、单任务加 Task 后缀（Cancel/CancelTask、Suspend/SuspendTask、
+// Resume/ResumeTask），于是 Suspended 的单任务版只能叫 SuspendedTask。
+// 谓词读感与作用域约定这里冲突，保后者：约定管着七个方法，读感只管这一个。
+func (d *Scheduler) SuspendedTask(name string) bool {
 	ctrl, state, err := d.lookupControl(name)
 	if err != nil || state.Done() {
 		return false

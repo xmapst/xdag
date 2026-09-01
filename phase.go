@@ -88,7 +88,7 @@ func (p Phase) Done() bool {
 // 因为某个任务被 SuspendTask 挂起而停滞不动的执行报告 PhaseRunning：
 // 调度器只知道「还没跑完」，无法知道「跑不完了」——任务体自己阻塞、配了
 // 无限重试、和被挂起，这三者在调度器看来完全一样。要区分停滞原因，遍历
-// States() 的 key 逐个调 TaskSuspended。
+// States() 的 key 逐个调 SuspendedTask。
 func (d *Scheduler) Phase() Phase {
 	d.mu.Lock()
 	defer d.mu.Unlock()

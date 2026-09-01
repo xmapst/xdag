@@ -119,7 +119,7 @@ func (d *Scheduler) Resume() {
 }
 
 // lookupControl 在 mu 保护下一次性查出任务的控制柄与当前状态，供
-// CancelTask/SuspendTask/ResumeTask/TaskSuspended 共用。
+// CancelTask/SuspendTask/ResumeTask/SuspendedTask 共用。
 func (d *Scheduler) lookupControl(name string) (*taskControl, State, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

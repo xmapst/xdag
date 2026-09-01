@@ -39,7 +39,7 @@ type Event struct {
 //     dag.Execute(ctx)                                      // 永远不返回
 //
 //   - 在回调里**查询**是安全的（States/Results/Progress/Phase/State/
-//     ExecutionOrder/TaskSuspended/Canceled/WriteGraph）：回调不持有 d.mu，
+//     ExecutionOrder/SuspendedTask/Canceled/WriteGraph）：回调不持有 d.mu，
 //     这些方法只是各自短暂取一次锁。
 //
 //   - **不等待的控制方法**（CancelTask/SuspendTask/ResumeTask）

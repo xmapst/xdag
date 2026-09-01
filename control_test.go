@@ -157,7 +157,7 @@ func TestCanceledUpstreamPropagatesAsCanceled(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 单任务控制：CancelTask / SuspendTask / ResumeTask / TaskSuspended
+// 单任务控制：CancelTask / SuspendTask / ResumeTask / SuspendedTask
 // ---------------------------------------------------------------------------
 
 // CancelTask 只取消目标任务这一条链路，不影响图里其他不相关的分支。
@@ -227,8 +227,8 @@ func TestSuspendTaskBlocksBetweenRetries(t *testing.T) {
 	if err := dag.SuspendTask("a"); err != nil {
 		t.Fatalf("SuspendTask: %v", err)
 	}
-	if !dag.TaskSuspended("a") {
-		t.Fatal("SuspendTask 之后 TaskSuspended 应为 true")
+	if !dag.SuspendedTask("a") {
+		t.Fatal("SuspendTask 之后 SuspendedTask 应为 true")
 	}
 
 	// 等过退避窗口，确认挂起确实拦住了第二次尝试
@@ -240,8 +240,8 @@ func TestSuspendTaskBlocksBetweenRetries(t *testing.T) {
 	if err := dag.ResumeTask("a"); err != nil {
 		t.Fatalf("ResumeTask: %v", err)
 	}
-	if dag.TaskSuspended("a") {
-		t.Fatal("ResumeTask 之后 TaskSuspended 应为 false")
+	if dag.SuspendedTask("a") {
+		t.Fatal("ResumeTask 之后 SuspendedTask 应为 false")
 	}
 
 	select {
@@ -292,8 +292,8 @@ func TestSuspendResumeCanCycleRepeatedly(t *testing.T) {
 		if err := dag.SuspendTask("a"); err != nil {
 			t.Fatalf("第 %d 轮 SuspendTask: %v", i+1, err)
 		}
-		if !dag.TaskSuspended("a") {
-			t.Fatalf("第 %d 轮：挂起后 TaskSuspended 应为 true", i+1)
+		if !dag.SuspendedTask("a") {
+			t.Fatalf("第 %d 轮：挂起后 SuspendedTask 应为 true", i+1)
 		}
 		// 挂起期间确认确实没有提前开始下一次尝试
 		select {
@@ -305,8 +305,8 @@ func TestSuspendResumeCanCycleRepeatedly(t *testing.T) {
 		if err := dag.ResumeTask("a"); err != nil {
 			t.Fatalf("第 %d 轮 ResumeTask: %v", i+1, err)
 		}
-		if dag.TaskSuspended("a") {
-			t.Fatalf("第 %d 轮：解挂后 TaskSuspended 应为 false", i+1)
+		if dag.SuspendedTask("a") {
+			t.Fatalf("第 %d 轮：解挂后 SuspendedTask 应为 false", i+1)
 		}
 	}
 
@@ -394,8 +394,8 @@ func TestActionsOnUnknownOrDoneTask(t *testing.T) {
 	if err := dag.ResumeTask("a"); !errors.Is(err, xdag.ErrTaskAlreadyDone) {
 		t.Errorf("ResumeTask(已完成任务) = %v, want ErrTaskAlreadyDone", err)
 	}
-	if dag.TaskSuspended("a") {
-		t.Error("已完成的任务 TaskSuspended 应为 false")
+	if dag.SuspendedTask("a") {
+		t.Error("已完成的任务 SuspendedTask 应为 false")
 	}
 }
 
@@ -438,8 +438,8 @@ func TestSuspendBeforeExecute(t *testing.T) {
 	if err := dag.SuspendTask("a"); err != nil {
 		t.Fatalf("Execute 之前 SuspendTask 应当可用，got %v", err)
 	}
-	if !dag.TaskSuspended("a") {
-		t.Fatal("Execute 之前挂起后 TaskSuspended 应为 true")
+	if !dag.SuspendedTask("a") {
+		t.Fatal("Execute 之前挂起后 SuspendedTask 应为 true")
 	}
 
 	done := make(chan error, 1)

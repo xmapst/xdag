@@ -112,7 +112,7 @@ func TestRunAndTaskSuspendAreIndependent(t *testing.T) {
 	if held.ran() != 0 {
 		t.Fatal("单独挂起的任务被整场恢复静默放行了——用户以为它还停着")
 	}
-	if !dag.TaskSuspended("held") {
+	if !dag.SuspendedTask("held") {
 		t.Fatal("单独挂起的状态被整场恢复清掉了")
 	}
 
@@ -144,7 +144,7 @@ func TestRunSuspendDoesNotUnstickTaskSuspend(t *testing.T) {
 	}
 	// 只松开整场那一路，单任务那一路还按着。
 	dag.Resume()
-	if !dag.TaskSuspended("a") {
+	if !dag.SuspendedTask("a") {
 		t.Fatal("整场恢复把单独挂起也解掉了")
 	}
 }
