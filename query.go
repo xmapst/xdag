@@ -11,9 +11,8 @@ import "maps"
 func (d *Scheduler) States() map[string]State {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	out := make(map[string]State, len(d.states))
-	maps.Copy(out, d.states)
-	return out
+	// d.states 在 New 里就建好，永不为 nil，因此 Clone 也永不返回 nil。
+	return maps.Clone(d.states)
 }
 
 // TaskResult 是单个任务在本次执行中的结果摘要。
@@ -63,9 +62,7 @@ type TaskResult struct {
 func (d *Scheduler) Results() map[string]TaskResult {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	out := make(map[string]TaskResult, len(d.taskResults))
-	maps.Copy(out, d.taskResults)
-	return out
+	return maps.Clone(d.taskResults)
 }
 
 // State 返回单个任务当前的状态；任务名不存在于本次构建的任务表中时

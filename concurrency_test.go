@@ -281,8 +281,8 @@ func TestPanicErrorIsStructured(t *testing.T) {
 		t.Fatalf("errors.Is(err, ErrTaskPanic) 应成立, got %v", err)
 	}
 
-	var pe *xdag.PanicError
-	if !errors.As(err, &pe) {
+	pe, ok := errors.AsType[*xdag.PanicError](err)
+	if !ok {
 		t.Fatalf("errors.As 取不到 *PanicError: %v", err)
 	}
 	if pe.Task != "a" {

@@ -282,7 +282,7 @@ func TestSuspendResumeCanCycleRepeatedly(t *testing.T) {
 		done <- err
 	}()
 
-	for i := 0; i < cycles; i++ {
+	for i := range cycles {
 		select {
 		case <-attemptStarted:
 		case <-time.After(5 * time.Second):

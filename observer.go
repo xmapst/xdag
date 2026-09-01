@@ -70,7 +70,7 @@ type Event struct {
 //
 // 回调里的 panic 会被接住并转成一条 ErrObserverPanic 错误汇入 Execute 的
 // 返回值——观察者是调用方代码，它出问题不该打垮整个进程，但也不该被静默吞掉。
-// 错误里包着一个 *ObserverPanicError，用 errors.As 可以取到 panic 值与调用栈。
+// 错误里包着一个 *ObserverPanicError，用 errors.AsType 可以取到 panic 值与调用栈。
 // 刻意不复用 PanicError，理由见 ObserverPanicError 的文档。
 // 任务的终态不受影响，此时它早已落定。
 //

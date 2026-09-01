@@ -209,9 +209,9 @@ func TestObserverPanicIsStructured(t *testing.T) {
 	if !errors.Is(err, xdag.ErrObserverPanic) {
 		t.Fatalf("want ErrObserverPanic, got %v", err)
 	}
-	var pe *xdag.ObserverPanicError
-	if !errors.As(err, &pe) {
-		t.Fatalf("errors.As 取不到 *ObserverPanicError: %v", err)
+	pe, ok := errors.AsType[*xdag.ObserverPanicError](err)
+	if !ok {
+		t.Fatalf("errors.AsType 取不到 *ObserverPanicError: %v", err)
 	}
 	if pe.Task != "a" || pe.Value != "observer boom" || len(pe.Stack) == 0 {
 		t.Errorf("ObserverPanicError = %+v", pe)

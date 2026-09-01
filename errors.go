@@ -28,11 +28,10 @@ var ErrAlreadyExecuted = errors.New("dag already executed")
 // 终止整个进程，因此调度器会把它 recover 下来，转换成本次尝试的失败。
 var ErrTaskPanic = errors.New("task panicked")
 
-// PanicError 描述一次被调度器接住的 panic，用 errors.As 取出即可拿到
+// PanicError 描述一次被调度器接住的 panic，用 errors.AsType 取出即可拿到
 // panic 值与调用栈：
 //
-//	var pe *xdag.PanicError
-//	if errors.As(err, &pe) {
+//	if pe, ok := errors.AsType[*xdag.PanicError](err); ok {
 //	    log.Printf("%s 第 %d 次尝试 panic: %v", pe.Task, pe.Attempt, pe.Value)
 //	    log.Print(string(pe.Stack))
 //	}

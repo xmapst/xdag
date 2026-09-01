@@ -5,8 +5,8 @@ package xdag
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
-	"sort"
 	"strings"
 )
 
@@ -30,7 +30,7 @@ func snapshotDeps(tasks map[string]ITask) map[string][]string {
 		if task == nil {
 			continue
 		}
-		out[name] = append([]string(nil), task.Dependencies()...)
+		out[name] = slices.Clone(task.Dependencies())
 	}
 	return out
 }
@@ -56,7 +56,7 @@ func validateGraph(tasks map[string]ITask, deps map[string][]string) error {
 		}
 	}
 	if len(dangling) > 0 {
-		sort.Strings(dangling)
+		slices.Sort(dangling)
 		return fmt.Errorf("%w: %s", ErrUnknownDependency, strings.Join(dangling, ", "))
 	}
 
@@ -77,7 +77,7 @@ func validateGraph(tasks map[string]ITask, deps map[string][]string) error {
 			// 撞上了递归栈里的祖先，从 path 中把环截出来
 			for i, n := range path {
 				if n == name {
-					cycle = append(append([]string{}, path[i:]...), name)
+					cycle = append(slices.Clone(path[i:]), name)
 					break
 				}
 			}
@@ -96,12 +96,7 @@ func validateGraph(tasks map[string]ITask, deps map[string][]string) error {
 	}
 
 	// 按名字排序后再遍历，保证多个环同时存在时报出的错误稳定可复现
-	names := make([]string, 0, len(tasks))
-	for name := range tasks {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(tasks)) {
 		if color[name] == white && dfs(name) {
 			return fmt.Errorf("%w: %s", ErrCircularDependency, strings.Join(cycle, " -> "))
 		}

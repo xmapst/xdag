@@ -97,9 +97,7 @@ func (d *Scheduler) newRetryExecutor(policy *RetryPolicy, ctrl *taskControl) *re
 	if effective.MaxInterval <= 0 {
 		effective.MaxInterval = 30 * time.Second
 	}
-	if effective.MaxInterval > hardMaxInterval {
-		effective.MaxInterval = hardMaxInterval
-	}
+	effective.MaxInterval = min(effective.MaxInterval, hardMaxInterval)
 	// 与 Jitter 同理：NaN 和 <=0 的比较都是 false，不显式挡就会一路穿到
 	// math.Pow，让退避从第二次起直接顶到 MaxInterval。+Inf 同理。
 	if math.IsNaN(effective.Multiplier) || math.IsInf(effective.Multiplier, 0) || effective.Multiplier <= 0 {
@@ -111,9 +109,9 @@ func (d *Scheduler) newRetryExecutor(policy *RetryPolicy, ctrl *taskControl) *re
 	if math.IsNaN(effective.Jitter) || effective.Jitter < 0 {
 		effective.Jitter = 0
 	}
-	if effective.Jitter > 1 {
-		effective.Jitter = 1
-	}
+	// NaN 已经被上一条挡掉了，这里可以放心用 min——内置 min 对浮点数遇 NaN
+	// 会原样返回 NaN，钳制不到。
+	effective.Jitter = min(effective.Jitter, 1)
 	if effective.MaxAttempts == 0 {
 		// 零值按「只执行一次」处理。把未填写的字段解释成「永不放弃」是个陷阱：
 		// &RetryPolicy{Interval: time.Second} 看起来只是想设个间隔，
@@ -151,7 +149,7 @@ func (r *retryExecutor) run(ctx context.Context, taskName string, fn func(ctx co
 	for attempt = 1; infiniteRetry || attempt <= maxAttempts; attempt++ {
 		select {
 		case <-ctx.Done():
-			return wrapWait(taskName, "canceled before attempt", ctx.Err(), lastErr)
+			return r.wrapWait(taskName, "canceled before attempt", ctx.Err(), lastErr)
 		default:
 		}
 
@@ -162,12 +160,12 @@ func (r *retryExecutor) run(ctx context.Context, taskName string, fn func(ctx co
 		// 挂起等待必须能被 Cancel 叫醒，否则一个被挂起的任务会让 Execute
 		// 永远等下去——挂起门是无限期的，没有别的东西会放行它。
 		if err := r.gate.wait(ctx); err != nil {
-			return wrapWait(taskName, "interrupted while suspended", err, lastErr)
+			return r.wrapWait(taskName, "interrupted while suspended", err, lastErr)
 		}
 
 		if err := fn(ctx, attempt); err == nil {
 			return nil // 成功
-		} else if lastErr == nil || !isInterruption(err) {
+		} else if lastErr == nil || !r.isInterruption(err) {
 			// 取消类错误不覆盖已经拿到的真实根因：一次尝试可能仅仅因为
 			// 在并发闸门上排队时被取消而返回 ctx.Err()，那不是任务的失败，
 			// 覆盖掉上一次的业务错误/panic 会让根因彻底消失。
@@ -189,7 +187,7 @@ func (r *retryExecutor) run(ctx context.Context, taskName string, fn func(ctx co
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return wrapWait(taskName, "canceled during retry wait", ctx.Err(), lastErr)
+			return r.wrapWait(taskName, "canceled during retry wait", ctx.Err(), lastErr)
 		case <-timer.C:
 			// 继续下一次尝试
 		}
@@ -204,7 +202,7 @@ func (r *retryExecutor) run(ctx context.Context, taskName string, fn func(ctx co
 }
 
 // isInterruption 判断错误是否只是「等待被打断」，而不是任务本身的失败。
-func isInterruption(err error) bool {
+func (r *retryExecutor) isInterruption(err error) bool {
 	return errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, ErrTaskCanceled) ||
@@ -217,7 +215,7 @@ func isInterruption(err error) bool {
 // 少了 last 那一半，被 ctx 掐断或被 Cancel 的任务就只剩一句「deadline
 // exceeded」，PanicError、业务哨兵、ErrNonRetryable 全都取不回来——而这几条
 // 等待路径恰恰是这类任务最常见的退出口。
-func wrapWait(taskName, where string, cause, last error) error {
+func (r *retryExecutor) wrapWait(taskName, where string, cause, last error) error {
 	if last == nil {
 		return fmt.Errorf("task %s %s: %w", taskName, where, cause)
 	}

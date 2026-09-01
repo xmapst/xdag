@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -19,7 +19,7 @@ import (
 // 多次执行同一张图，顺序完全可能不同。
 func (d *Scheduler) ExecutionOrder() string {
 	d.mu.Lock()
-	order := append([]string(nil), d.executionOrder...)
+	order := slices.Clone(d.executionOrder)
 	d.mu.Unlock()
 
 	var sb = strings.Builder{}
@@ -55,7 +55,7 @@ func (d *Scheduler) WriteGraph(w io.Writer) error {
 			roots = append(roots, name)
 		}
 	}
-	sort.Strings(roots)
+	slices.Sort(roots)
 
 	expanded := make(map[string]bool, len(d.depOrder))
 	for _, root := range roots {
@@ -75,8 +75,9 @@ func (d *Scheduler) WriteGraph(w io.Writer) error {
 // writeChain 递归写出 name 的下游依赖链，prefix 是当前缩进前缀，
 // expanded 记录哪些任务的子树已经展开过。
 func (d *Scheduler) writeChain(w io.Writer, name, prefix string, expanded map[string]bool) error {
-	children := append([]string(nil), d.dependents[name]...)
-	sort.Strings(children)
+	// 收集 + 排序一步到位；slices.Sorted 收进的是一份新切片，
+	// 不会就地改动 d.dependents[name]。
+	children := slices.Sorted(slices.Values(d.dependents[name]))
 
 	for _, child := range children {
 		if expanded[child] {

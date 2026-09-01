@@ -6,7 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 
 	"github.com/xmapst/xdag"
 )
@@ -86,12 +87,7 @@ func Example_states() {
 	_, _ = dag.Execute(context.Background()) // check 必然失败，忽略聚合错误
 
 	states := dag.States()
-	names := make([]string, 0, len(states))
-	for name := range states {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(states)) {
 		fmt.Printf("%-8s %s\n", name, states[name])
 	}
 

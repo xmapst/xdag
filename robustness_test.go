@@ -638,12 +638,11 @@ func TestObserverPanicIsNotTaskPanic(t *testing.T) {
 	if errors.Is(err, xdag.ErrTaskPanic) {
 		t.Error("观察者 panic 被误报成任务 panic")
 	}
-	var tp *xdag.PanicError
-	if errors.As(err, &tp) {
+	if tp, ok := errors.AsType[*xdag.PanicError](err); ok {
 		t.Errorf("不该取到 *PanicError（那代表任务体炸了）: %+v", tp)
 	}
-	var op *xdag.ObserverPanicError
-	if !errors.As(err, &op) || op.Task != "a" || len(op.Stack) == 0 {
+	op, ok := errors.AsType[*xdag.ObserverPanicError](err)
+	if !ok || op.Task != "a" || len(op.Stack) == 0 {
 		t.Errorf("应当取到 *ObserverPanicError, got %v", err)
 	}
 	assertState(t, dag, "a", xdag.StateSuccess)
